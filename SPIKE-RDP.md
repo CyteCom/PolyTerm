@@ -101,7 +101,7 @@ the environment:
 $env:RDP_HOSTNAME = "host:3389"
 $env:RDP_USERNAME = "user"           # or DOMAIN\user, or --domain
 $env:RDP_PASSWORD = Read-Host -AsSecureString | ConvertFrom-SecureString -AsPlainText
-$env:IRONRDP_LOG  = "info,ironrdp_connector=debug,ironrdp_egfx=debug"
+$env:IRONRDP_LOG  = "info,ironrdp_egfx=debug"
 ironrdp-viewer --log-file spike-host1.log
 ```
 
@@ -114,11 +114,21 @@ For each host, record from the log — do not guess:
 | Question | Where the answer is |
 |---|---|
 | Did it connect? | `ERROR ironrdp_viewer::app` on failure; a window on success |
-| Which security layer? | `Server confirmed connection selected_protocol=…` (`ironrdp_connector`, info). `HYBRID` = NLA over TLS. |
-| Did NLA happen? | `Begin NLA using CredSSP` (`ironrdp_connector`, debug) |
+| Which security layer? | `Server confirmed connection selected_protocol=…` (`ironrdp_connector`, info). `HYBRID` = CredSSP, i.e. NLA over TLS. |
+| Did NLA succeed? | `selected_protocol=HYBRID` followed by a desktop. Only if it *fails*, add `ironrdp_connector=debug` for `Begin NLA using CredSSP` and the exchange — see the caution below. |
 | Was the GFX pipeline negotiated, and at which version? | `EGFX capabilities confirmed` (`ironrdp_egfx`, debug). Expect **V8**. No such line means the legacy path. |
 | Which codec on the legacy path? | Add `ironrdp_session=trace`; look for `Surface bits codec_id=…` |
 | Did the host ask for something unsupported? | `Forwarding unsupported codec to handler` (`ironrdp_egfx`, trace) — and visible corruption |
+
+**Caution on `ironrdp_connector=debug`.** It dumps the CredSSP exchange, and an NTLM
+authenticate message carries an NTLMv2 response that is crackable offline. The plaintext
+password is never logged — checked at `f639145`: upstream's `Credentials` derives `Debug`
+without redaction, but nothing logs it and the client config strips secrets before exposing
+itself — so a connector-debug log is sensitive rather than fatal. Do not share one. The
+default filter above keeps the connector at info.
+
+Note for M8: `polyterm-rdp` must never `Debug`-print the `ironrdp` config it builds. That
+is exactly the NFR-8 hole `Secret<T>` exists to close on our side of the boundary.
 
 ### 3. Measure
 
