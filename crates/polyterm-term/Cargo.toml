@@ -9,6 +9,7 @@ repository.workspace = true
 
 [dependencies]
 polyterm-core = { path = "../polyterm-core" }
+alacritty_terminal = { workspace = true }
 
 [lints]
 workspace = true
