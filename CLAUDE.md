@@ -2,9 +2,6 @@
 
 Operating instructions for Claude Code working in this repository.
 
-> **Project name is a placeholder.** Everything is named `polyterm` / `polyterm-*`.
-> Rename before the first commit if you want something else; do it once, up front.
-
 ---
 
 ## 1. What this is
