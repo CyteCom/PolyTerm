@@ -1,0 +1,37 @@
+# cargo-deny configuration. Enforces NFR-11 in CI: every crate in the tree
+# must carry a licence compatible with a free-software release.
+#
+# Run locally with `cargo deny check licenses bans sources`. Advisories are
+# not part of the CI gate (see .github/workflows/ci.yml) but `cargo deny check
+# advisories` is worth running before a release.
+
+[licenses]
+# Anything not listed here fails. Add to this list deliberately, with the
+# crate that needs it named in the commit message.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "0BSD",
+    "BSL-1.0",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "Unlicense",
+]
+
+[bans]
+# Duplicate versions of a crate are a size and build-time cost, not a
+# correctness problem. Report them; do not fail on them.
+multiple-versions = "warn"
+
+[sources]
+# Everything comes from crates.io. A git dependency is a decision to record in
+# DECISIONS.md, not something to slip in.
+unknown-registry = "deny"
+unknown-git = "deny"

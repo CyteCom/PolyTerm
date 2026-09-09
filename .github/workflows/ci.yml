@@ -55,3 +55,41 @@ jobs:
 
       - name: test
         run: cargo test --workspace
+
+  # The core crate's contracts are documented with intra-doc links, and a
+  # broken one is invisible to clippy. This is the only check that sees it.
+  doc:
+    name: rustdoc
+    runs-on: ubuntu-latest
+    env:
+      RUSTDOCFLAGS: -D warnings
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo doc --workspace --no-deps
+
+  # rust-version in Cargo.toml is a claim; this is what makes it true. The
+  # resolver is MSRV-aware, so a failure here means a dependency has no
+  # version that supports 1.85 and the declared MSRV must be raised honestly.
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-targets
+
+  # NFR-11: no component with a licence incompatible with a free-software
+  # release. Licence drift in a transitive dependency is silent without this.
+  # Advisories are deliberately not checked here: a new advisory would turn
+  # every unrelated push red. Run `cargo deny check advisories` by hand.
+  deny:
+    name: cargo-deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check licenses bans sources

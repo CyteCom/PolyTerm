@@ -67,8 +67,13 @@ cargo run -p polyterm
 cargo build --target x86_64-pc-windows-msvc
 ```
 
+On Windows, run cargo from PowerShell, not Git Bash. Git Bash puts coreutils `link`
+ahead of MSVC's `link.exe` on `PATH`, and every build script then fails with
+`link: extra operand`. The toolchain is fine; the shell is wrong.
+
 There is no CI-only step you cannot run locally. If `clippy -D warnings` fails, the
-change is not finished.
+change is not finished. CI additionally runs `cargo doc` with `-D warnings`, a check on
+the declared MSRV, and `cargo deny` for licences — all runnable locally too.
 
 ---
 
