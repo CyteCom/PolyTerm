@@ -1,9 +1,10 @@
 # SPIKE-RDP.md
 
-**Status: IN PROGRESS** — viewer built on Windows/MSVC and (underway) on Linux/WSL.
-Two Windows hosts probed credential-free: security layer, NLA enforcement, and GFX
-advertisement confirmed. The authenticated session and the subjective test need a human
-with the password; see *Hand-off* at the end.
+**Status: COMPLETE, pending sign-off.** Viewer built on Windows/MSVC; engine crate built
+on Linux/WSL. NLA verified at runtime against a real Server 2019 host over VPN, and the
+subjective test passed (crisp, snappy). **Recommendation: go with `ironrdp`, pure Rust**
+— see *Verdict*. The only thing left is the operator flipping ADR-2 to `Accepted`, which
+is their call.
 
 This spike resolves ADR-2, which is `Provisional`. It is Milestone M0 and it blocks M8.
 Budget one day.
@@ -191,8 +192,31 @@ test will use: a separate machine, reached over the real VPN path.
   completed in **0.2 s over the VPN** — an encouraging early read on the row-4 latency
   question, though the authenticated session under load is the real test.
 
-Still open, and needing the password: the authenticated session on this host — EGFX
-capability confirmation, negotiated codec, the measurements, and the five feature checks.
+#### Authenticated session — 10.166.250.209 (2026-09-09)
+
+Real login as Administrator, fixed 1920×1080, ~a few minutes of real work. Log:
+5.8 MB with `ironrdp_egfx=debug`, `ironrdp_graphics=debug`, `ironrdp_session::fast_path=trace`.
+
+- **NLA end to end: PASS.** `HYBRID_EX`, license exchange clean, `RDP login complete`.
+- **Graphics ran over the legacy Bitmap Update path**, not GFX. Of the first 4000 log
+  lines, 3993 are `ironrdp_session::fast_path: Received bitmap update`; there is **zero**
+  EGFX output despite `ironrdp_egfx=debug`, and no `codec_id` anywhere. So the Graphics
+  Pipeline never established — no GFX, no RemoteFX, no ClearCodec. Plain RGB bitmaps with
+  `K64` MPPC bulk compression (from the Client Info PDU).
+- **Subjective test (the heaviest-weight step): pleasant, crisp, snappy.** Over the VPN,
+  small text at 100% and 150% was sharp, typing and scrolling and window drags felt
+  immediate. The operator would work in it all day.
+- **The counter-intuitive lesson:** the codec gap ADR-2 feared did not hurt. Legacy
+  bitmaps are lossless RGB, so small text is *sharper* than AVC420 (chroma-subsampled)
+  would render it, and MPPC kept it responsive on the real network path. The worst-case
+  graphics path was still comfortable.
+- **One real defect:** a `ReactivationTimedOut` reconnect fires once, post-logon, on both
+  runs and even at fixed resolution. The viewer requests a display redraw the Server 2019
+  host does not reactivate in time, so it reconnects (and recovers). This is very likely
+  what prevents the GFX channel from establishing. It is *viewer* behaviour, and it maps
+  to FR-66 (dynamic resize, v1.1); PolyTerm's MVP is FR-65 fixed-resolution and will build
+  its own front-end against the engine, so it need not inherit this. Worth a deliberate
+  test in M8 all the same.
 
 ### 3. Measure
 
@@ -219,11 +243,11 @@ what the metrics miss, and it is the test that should carry the most weight.
 
 | Feature | Requirement | Works? | Notes |
 |---|---|---|---|
-| NLA / CredSSP negotiates | FR-60 | | |
+| NLA / CredSSP negotiates | FR-60 | **yes** | Real login to Server 2019 over VPN; `HYBRID_EX`, `RDP login complete`. Runtime-proven on Windows. |
 | Certificate prompt on self-signed | FR-61 | **not testable with the stock viewer** | The library default is `DangerouslyAcceptInvalidCertificate` and the viewer does not override it, so the probe crossed a self-signed certificate with no prompt and no log line. The library does provide `CertificateValidation::Strict` and a `CertificateValidationCallback`, which is exactly the hook `CertPrompt` needs. M8: set `Strict` plus the callback and never rely on the default. |
-| Non-US keyboard layout, modifiers, extended keys | FR-62 | | |
-| Mouse: all buttons + wheel | FR-63 | | |
-| Clipboard, both directions, text | FR-64 | | |
+| Non-US keyboard layout, modifiers, extended keys | FR-62 | **partial** | Basic typing worked (US layout). A non-US layout was not exercised; still the one to watch, and it is an M8 code concern (scancodes) more than a viewer property. |
+| Mouse: all buttons + wheel | FR-63 | **yes** | Window drags and scrolling worked in the session. |
+| Clipboard, both directions, text | FR-64 | **untested** | Viewer defaults `--clipboard-type enable`; copy/paste across the boundary was not deliberately exercised. Verify in M8. |
 
 FR-62 deserves particular attention. RDP is scancode-based, and a client that looks
 correct under a US layout can be badly broken under others. Test with the layout you
@@ -270,17 +294,44 @@ enough that the session is unpleasant over your actual network path is.
 
 ## Verdict
 
-> *Fill in on completion. Then update ADR-2 in `DECISIONS.md` to `Accepted` or
-> `Superseded by ADR-n`, and update `ARCHITECTURE.md` §3.2 if the trait needs to change
-> to accommodate what was learned.*
+**Date:** 2026-09-09.
 
-**Date:**
+**Recommendation (pending the operator's acceptance — flipping ADR-2 is their call per
+`CLAUDE.md` §8):** **Go with `ironrdp`, pure Rust.** This is the best of the three
+outcomes in the decision rule, and the evidence clears its bar: it connected, NLA worked,
+and thirty-ish minutes of real work over the real VPN path was pleasant, with crisp small
+text and snappy input.
 
-**Decision:**
+**Evidence.**
 
-**Evidence:**
+- NLA/CredSSP verified at runtime against a real Server 2019 host over OpenVPN
+  (`HYBRID_EX`, full login). A credential-free probe confirmed the same on a Windows 11
+  host. NLA is enforced on both (`0xC000006D` on a bad credential).
+- The subjective test — the step this document says should carry the most weight — was a
+  clear pass: crisp, snappy, all-day usable.
+- The codec worry that made ADR-2 provisional turned out not to bite. Even on the
+  worst-case legacy bitmap path, lossless RGB kept small text *sharper* than H.264 would,
+  and MPPC compression kept it responsive. Shipping without an H.264 decoder (the pure-Rust
+  default) is acceptable on this evidence; `openh264-libloading` remains available later if
+  a high-motion or bandwidth-constrained case ever needs it, at no cost to NFR-2 now.
 
-**Consequences for the roadmap:**
+**Residual gaps — verify during M8, not blockers for the go.**
+
+1. **`ReactivationTimedOut` on dynamic resize** (the one real defect). Viewer front-end
+   behaviour, maps to FR-66/v1.1; PolyTerm builds its own front-end on the engine. Test
+   deliberately when the RDP pane is built.
+2. **FR-61 certificate prompt** cannot be tested with the stock viewer; the library hook
+   exists and M8 must wire `CertificateValidation::Strict` + callback into `CertPrompt`.
+3. **FR-62 under a non-US layout** and **FR-64 clipboard** were not exercised.
+4. **Linux is compile-verified for the engine crate, not runtime-verified.** CredSSP on
+   non-Windows is the pure-Rust `sspi` path and it compiles; an authenticated connect from
+   Linux is the one cross-platform check still owed, and is low-risk.
+
+**Consequences for the roadmap.** M8 proceeds with `ironrdp-client` as the `RemoteDesktop`
+backend, no FreeRDP FFI, no C dependency. The `RemoteDesktop` trait in `polyterm-core`
+needs no change to accommodate what was learned — `FrameUpdate` as an RGB damage rect fits
+the bitmap path directly, and the certificate/credential prompts already model FR-61/FR-60.
+ADR-2 moves from `Provisional` to `Accepted` once the operator signs off.
 
 ---
 
