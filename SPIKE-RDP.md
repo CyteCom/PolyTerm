@@ -1,7 +1,9 @@
 # SPIKE-RDP.md
 
-**Status: IN PROGRESS** — viewer built and verified on Windows/MSVC (2026-09-09).
-Steps 2–5 need real hosts and a human; see *Hand-off* at the end.
+**Status: IN PROGRESS** — viewer built on Windows/MSVC and (underway) on Linux/WSL.
+Two Windows hosts probed credential-free: security layer, NLA enforcement, and GFX
+advertisement confirmed. The authenticated session and the subjective test need a human
+with the password; see *Hand-off* at the end.
 
 This spike resolves ADR-2, which is `Provisional`. It is Milestone M0 and it blocks M8.
 Budget one day.
@@ -59,7 +61,7 @@ common way this kind of spike produces a misleading pass.
 | # | Host | OS / build | Auth | Security layer | GPO notes |
 |---|---|---|---|---|---|
 | 1 | 10.0.10.10 (`DESKTOP-EV3LKMN`) | Windows 11 24H2, build 26100 | jeffw, password | **`HYBRID_EX`** — confirmed by probe | NLA enforced: a bad credential fails inside CredSSP (`0xC000006D`) before any graphical logon. Server advertises `DYNVC_GFX_PROTOCOL_SUPPORTED` and restricted-admin mode. LAN, sub-millisecond RTT. |
-| 2 | | Windows Server (session host) | | NLA | *none available yet* |
+| 2 | 10.166.250.209 (`WIN-2QQ6BE2KRG9`) | Windows Server 2019, build 17763 | Administrator, password | **`HYBRID_EX`** — confirmed by probe | NLA enforced (`0xC000006D` on a bad credential). Reached over **OpenVPN** (client 10.19.0.2), so this is also the real-WAN-path target row 4 asks for. Advertises `DYNVC_GFX_PROTOCOL_SUPPORTED` and `REDIRECTED_AUTHENTICATION_MODE_SUPPORTED` (Remote Credential Guard capable). Full CredSSP round-trip in 0.2 s over the VPN. |
 | 3 | 10.0.10.12 | Ubuntu, OpenSSH 10.2p1 | — | — | **No `xrdp`**: 3389 closed. Becomes a target only if xrdp is installed. |
 | 4 | | *(optional)* Windows 11 over VPN / high latency | | NLA | |
 
@@ -89,8 +91,19 @@ cargo build --release -p ironrdp-viewer      # Windows, MSVC 14.51, Build Tools 
 - Upstream also publishes prebuilt, checksummed viewer binaries on GitHub Releases
   under `ironrdp-viewer-v*` tags, if a second machine needs one.
 
-The Linux build has **not** been done. Do it before writing the verdict — CredSSP differs
-across platforms and the crate rules in `CLAUDE.md` 5 apply to spikes too.
+The Linux build was attempted in WSL (Ubuntu 26.04). It needs the X11/xkb dev headers
+winit and softbuffer link against, and `sudo` in WSL is not passwordless here, so it is
+blocked on one privileged step — run once:
+
+```bash
+wsl -d Ubuntu-26.04 sudo apt-get install -y build-essential pkg-config \
+    libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev \
+    libxcursor-dev libxrandr-dev libxi-dev
+```
+
+After that the toolchain install and `cargo build -p ironrdp-viewer` need no privileges.
+Do it before writing the verdict — CredSSP differs across platforms and the crate rules
+in `CLAUDE.md` 5 apply to spikes too.
 
 ### 2. Connect to each target
 
@@ -153,11 +166,29 @@ credential was needed to learn it.
 The server certificate was accepted silently; see FR-61 in step 5 for why and what M8
 must do about it.
 
-Still open on this host: the authenticated session — EGFX capability confirmation, codec,
-the measurements, the feature checks. **Constraint found afterwards:** 10.0.10.10 is the
-machine the operator sits at, so it cannot be the subjective-test target from itself; an
-RDP logon as the console user moves that session to the client and locks the console.
-The credential-free results above stand — they describe the host, not the session.
+**Note:** 10.0.10.10 turned out to be the machine the operator sits at, so it cannot be
+the subjective-test target from itself — an RDP logon as the console user would move the
+session to the client and lock the console. Its credential-free results stand as a second
+data point (they describe the host, not the session); the authenticated session runs
+against 10.166.250.209 instead.
+
+#### Results so far — 10.166.250.209 (Server 2019), credential-free probe (2026-09-09)
+
+Same method, same fake username. This is the host the authenticated run and the subjective
+test will use: a separate machine, reached over the real VPN path.
+
+- Client offered `SSL | HYBRID | HYBRID_EX`; server selected **`HYBRID_EX`**. NLA enforced
+  — `STATUS_LOGON_FAILURE (0xC000006D)` inside CredSSP, before any graphical logon.
+- Response flags add `REDIRECTED_AUTHENTICATION_MODE_SUPPORTED` over the Win 11 box
+  (Remote Credential Guard capable), plus `DYNVC_GFX_PROTOCOL_SUPPORTED`.
+- NTLM CHALLENGE identifies it as `WIN-2QQ6BE2KRG9`, Windows 10.0 build **17763**
+  (Server 2019).
+- Reached over OpenVPN (client 10.19.0.2). The full multi-round-trip CredSSP exchange
+  completed in **0.2 s over the VPN** — an encouraging early read on the row-4 latency
+  question, though the authenticated session under load is the real test.
+
+Still open, and needing the password: the authenticated session on this host — EGFX
+capability confirmation, negotiated codec, the measurements, and the five feature checks.
 
 ### 3. Measure
 
@@ -251,15 +282,30 @@ enough that the session is unpleasant over your actual network path is.
 
 ## Hand-off: what remains and who does it
 
-Done by the build: step 1 on Windows; the codec landscape above; ADR-2's stale premise
-corrected. Everything below needs your hosts, your credentials, and your eyes.
+Done: the Windows build; both credential-free probes (security layer, NLA enforcement, GFX
+advertisement, host identity for hosts 1 and 2); the codec-landscape correction; ADR-2's
+stale premise fixed. The target table rows for 10.0.10.10, 10.166.250.209, and the Ubuntu
+box are filled. What remains needs the Administrator password and a human at the screen.
 
-1. Fill in the target table. At least one host over the real network path.
-2. Run step 2 against each, keeping the log files. Paste the `selected_protocol` and
-   `EGFX capabilities confirmed` lines into the table.
-3. Steps 3–5. Step 4 is the one that matters.
-4. Build and run the viewer on Linux at least once before the verdict.
-5. Write the verdict. Update ADR-2.
+1. **Authenticated session** against 10.166.250.209 (the Win 11 box can't be its own
+   target). Run it yourself so the password never reaches this transcript:
+
+   ```powershell
+   $env:RDP_HOSTNAME = "10.166.250.209:3389"
+   $env:RDP_USERNAME = "Administrator"
+   $env:RDP_PASSWORD = Read-Host -AsSecureString | ConvertFrom-SecureString -AsPlainText
+   $env:IRONRDP_LOG  = "info,ironrdp_egfx=debug"
+   ironrdp-viewer --log-file "$env:TEMP\spike-authed.log"
+   ```
+
+   Hand back `spike-authed.log` and the negotiated codec / EGFX line gets read out of it
+   for the table — that part is mechanical.
+2. **Steps 3–5** in the live window: the measurements, the five feature checks (FR-62
+   under your keyboard layout especially), and the thirty minutes of real work that
+   carries the most weight.
+3. **Finish the Linux build**: the one `apt-get` line in step 1, then the rest is
+   unprivileged and can be driven from here.
+4. **Write the verdict.** Update ADR-2 from `Provisional` to `Accepted` (or `Superseded`).
 
 ---
 
