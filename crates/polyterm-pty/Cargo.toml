@@ -10,6 +10,9 @@ repository.workspace = true
 [dependencies]
 polyterm-core = { path = "../polyterm-core" }
 tokio = { workspace = true }
+portable-pty = { workspace = true }
+bytes = { workspace = true }
+tracing = { workspace = true }
 
 [lints]
 workspace = true
