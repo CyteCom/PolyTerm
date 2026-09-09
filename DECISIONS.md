@@ -177,6 +177,13 @@ platforms already solved this.
 fallback too: if the keyring is unavailable, the correct behaviour is to prompt every time,
 not to silently write secrets somewhere weaker.
 
+**Consequence.** Secrets still pass through our memory — a password on its way from the
+keyring to `russh`. In transit they are held in `Secret<T>`, which cannot be `Debug`- or
+`Display`-printed, is neither `Clone` nor `Serialize`, and is zeroised on drop through the
+`zeroize` crate (pure Rust, no dependencies of its own). There is no accessor that moves
+the value out un-zeroised. How a secret reaches a backend at all is `ARCHITECTURE.md` §6:
+backends have no keyring access and never will.
+
 ---
 
 ## ADR-9 · Accepted · SQLite for the session store

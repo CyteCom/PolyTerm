@@ -71,6 +71,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # --- misc --------------------------------------------------------------------
 uuid         = { version = "1", features = ["v4", "serde"] }
 parking_lot  = "0.12"         # (unused until M2)
+# Scrubs Secret<T> from memory on drop. Pure Rust, no mandatory dependencies
+# of its own; see the consequence recorded under ADR-8.
+zeroize      = "1.9"
 
 # Enforced workspace-wide via `[lints] workspace = true` in every member.
 # `unwrap`/`expect` are a hard rule from CLAUDE.md 5, not a preference; test

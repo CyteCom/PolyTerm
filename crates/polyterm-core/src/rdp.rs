@@ -7,10 +7,13 @@
 
 use std::sync::Arc;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 
 use crate::error::RdpError;
+use crate::prompt::{CertPrompt, CredentialPrompt};
 use crate::session::RdpConfig;
+use crate::transport::DisconnectReason;
 
 /// Frame updates. Small: the UI drains the whole receiver each frame and
 /// applies every pending update before painting once, so a deep queue buys
@@ -23,22 +26,56 @@ pub const RDP_INPUT_CHANNEL_CAPACITY: usize = 256;
 /// Lifecycle and error reporting.
 pub const RDP_EVENT_CHANNEL_CAPACITY: usize = 32;
 
-/// A connectable remote desktop session.
+/// A backend that can open remote desktop sessions.
 ///
-/// Not object-safe, for the same reason as [`crate::Transport`]: the uniform
-/// surface is [`RdpHandle`], not the trait.
-pub trait RemoteDesktop: Send + 'static {
-    fn spawn(self, cfg: RdpConfig) -> Result<RdpHandle, RdpError>;
+/// Same shape and same reasoning as [`crate::Transport`]: one value opens many
+/// sessions, the runtime is passed explicitly, and the trait is not
+/// object-safe because [`RdpHandle`] is the erased surface.
+pub trait RemoteDesktop: Send + Sync + 'static {
+    /// Start a session on `rt`. Returns as soon as the session's tasks are
+    /// spawned; connection progress is reported on the handle's `events`.
+    fn spawn(&self, rt: &Handle, cfg: RdpConfig) -> Result<RdpHandle, RdpError>;
 }
 
-/// The live end of a spawned remote desktop session.
+/// The UI's end of a remote desktop session. Every channel here is bounded.
 #[derive(Debug)]
 pub struct RdpHandle {
     /// Damage-rect updates. Never a full-screen blit unless the server sent
     /// one.
     pub frames: mpsc::Receiver<FrameUpdate>,
     pub input: mpsc::Sender<RdpInput>,
+    /// When this yields `None` the backend is gone and the handle is finished.
     pub events: mpsc::Receiver<RdpEvent>,
+}
+
+/// The backend's end of a remote desktop session.
+#[derive(Debug)]
+pub struct RdpBackendEnd {
+    pub frames: mpsc::Sender<FrameUpdate>,
+    pub input: mpsc::Receiver<RdpInput>,
+    pub events: mpsc::Sender<RdpEvent>,
+}
+
+impl RdpHandle {
+    /// Create both ends of a session's channels at the standard capacities.
+    /// See [`crate::TransportHandle::new_pair`] for why this exists.
+    pub fn new_pair() -> (Self, RdpBackendEnd) {
+        let (frames_tx, frames_rx) = mpsc::channel(FRAME_CHANNEL_CAPACITY);
+        let (input_tx, input_rx) = mpsc::channel(RDP_INPUT_CHANNEL_CAPACITY);
+        let (events_tx, events_rx) = mpsc::channel(RDP_EVENT_CHANNEL_CAPACITY);
+        (
+            Self {
+                frames: frames_rx,
+                input: input_tx,
+                events: events_rx,
+            },
+            RdpBackendEnd {
+                frames: frames_tx,
+                input: input_rx,
+                events: events_tx,
+            },
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,27 +141,58 @@ pub enum RdpInput {
     },
 }
 
-/// A request for a human decision about a server certificate (FR-61).
-///
-/// Same pattern as [`crate::HostKeyPrompt`]: the task sends this, awaits the
-/// reply, and continues. Never auto-accept.
-#[derive(Debug)]
-pub struct CertPrompt {
-    pub host: String,
-    pub fingerprint: String,
-    pub subject: String,
-    pub issuer: String,
-    /// Why the certificate did not verify: self-signed, name mismatch, expired.
-    pub reason: String,
-    pub reply: oneshot::Sender<bool>,
-}
-
+/// Lifecycle of a remote desktop session. Same semantics as
+/// [`crate::TransportEvent`]: the handle is finished only when `events`
+/// closes, `Disconnected` is a state and not an ending, and `Error` alone
+/// never means the link is gone.
 #[derive(Debug)]
 pub enum RdpEvent {
     Connecting,
-    CertificatePrompt(CertPrompt),
-    Connected { width: u16, height: u16 },
+    /// An answer is required before the TLS handshake can complete (FR-61).
+    Certificate(CertPrompt),
+    /// An answer is required before NLA can proceed. CredSSP needs the
+    /// password before anything else happens, so this arrives early.
+    Credential(CredentialPrompt),
+    Connected {
+        width: u16,
+        height: u16,
+    },
     ClipboardFromServer(ClipboardData),
-    Disconnected { reason: String },
+    Disconnected {
+        reason: DisconnectReason,
+    },
     Error(RdpError),
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_pair_uses_the_standard_capacities() {
+        let (ui, backend) = RdpHandle::new_pair();
+        assert_eq!(backend.frames.max_capacity(), FRAME_CHANNEL_CAPACITY);
+        assert_eq!(ui.input.max_capacity(), RDP_INPUT_CHANNEL_CAPACITY);
+        assert_eq!(backend.events.max_capacity(), RDP_EVENT_CHANNEL_CAPACITY);
+    }
+
+    #[test]
+    fn frames_share_pixels_without_copying() {
+        let pixels: Arc<[u8]> = Arc::from(vec![0u8; 16]);
+        let update = FrameUpdate {
+            rect: Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            pixels: Arc::clone(&pixels),
+            stride: 8,
+            format: PixelFormat::Bgra8,
+        };
+        let copy = update.clone();
+        assert!(Arc::ptr_eq(&update.pixels, &copy.pixels));
+        assert_eq!(Arc::strong_count(&pixels), 3);
+    }
 }

@@ -68,53 +68,65 @@ them as design work, not implementation.
 Every byte-stream session — SSH shell, serial port, local PTY — is the same shape.
 
 ```rust
-/// A connectable byte-stream session. Constructed cheaply; does no I/O until spawned.
-pub trait Transport: Send + 'static {
+/// A backend that opens byte-stream sessions of one kind. One value opens many sessions
+/// and lives for the life of the process. Constructing it does no I/O.
+pub trait Transport: Send + Sync + 'static {
+    /// Per-session configuration. Holds no secrets — those arrive as prompts (§6).
     type Config: Send + 'static;
 
-    /// Consume self and start the session on the current tokio runtime.
-    fn spawn(self, cfg: Self::Config) -> Result<TransportHandle, TransportError>;
-
     /// Stable identifier for logs and the UI.
-    fn kind(&self) -> TransportKind;
+    const KIND: TransportKind;
+
+    /// Start a session on `rt`. Returns once the session's tasks are spawned;
+    /// progress is reported on the handle's `events`.
+    fn spawn(&self, rt: &tokio::runtime::Handle, cfg: Self::Config)
+        -> Result<TransportHandle, TransportError>;
 }
 
+/// The UI's end. `TransportHandle::new_pair()` builds it together with the backend's
+/// mirror-image end, at the standard bounded capacities.
 pub struct TransportHandle {
-    /// Bytes from the far end, already chunked. Bounded — backpressure is intentional.
-    pub output:  mpsc::Receiver<Bytes>,
-    /// Bytes to the far end (keystrokes, pastes).
-    pub input:   mpsc::Sender<Bytes>,
-    /// Out-of-band control. Backends ignore what does not apply to them.
-    pub control: mpsc::Sender<ControlMsg>,
-    /// Lifecycle and error reporting.
-    pub events:  mpsc::Receiver<TransportEvent>,
+    pub output:  mpsc::Receiver<Bytes>,           // from the far end, already chunked
+    pub input:   mpsc::Sender<Bytes>,             // keystrokes, pastes
+    pub control: mpsc::Sender<ControlMsg>,        // out-of-band
+    pub events:  mpsc::Receiver<TransportEvent>,  // None ⇒ backend gone, handle finished
 }
 
 pub enum ControlMsg {
     Resize { cols: u16, rows: u16 },  // SSH + PTY; no-op for serial
     Break,                            // serial BREAK; SSH break request
     SetSignal(SerialSignal, bool),    // DTR / RTS — serial only
-    Disconnect,
+    Reconnect,                        // after Disconnected; ignored where unsupported
+    Disconnect,                       // answered with Disconnected, then events closes
 }
 
 pub enum TransportEvent {
     Connecting,
-    HostKey(HostKeyPrompt),           // UI must answer; see §6
+    HostKey(HostKeyPrompt),           // answer required — §6
+    Credential(CredentialPrompt),     // answer required, may repeat — §6
     Authenticated,
     Connected,
-    Disconnected { reason: DisconnectReason },
-    Error(TransportError),
+    Disconnected { reason: DisconnectReason },  // a state, not an ending
+    Error(TransportError),            // the session continues
 }
 ```
 
 Notes that matter:
 
 - **Bounded channels, always.** An unbounded `output` channel turns a fast remote
-  `cat` into unbounded memory growth. Bound it and let the reader task feel the
-  backpressure.
+  `cat` into unbounded memory growth. `new_pair()` builds every channel at the standard
+  capacity and is the only way a backend should obtain them; the reader task feels the
+  backpressure, and that is the design.
+- **The runtime is passed in.** Sessions are opened from the UI thread, which is not a
+  runtime thread. `Handle::current()` there is a panic at runtime; a `&Handle` parameter
+  is a missing argument at compile time.
+- **`Disconnected` does not finish the handle.** Only `events` closing does. A dropped
+  link is a state the tab sits in and recovers from — automatically under FR-29, or on
+  the user's `Reconnect` once an unplugged adapter returns under FR-49 — without the tab
+  being torn down and rebuilt. `Error` is weaker still: the session continues.
 - `Resize` being a no-op for serial is correct behaviour, not a gap.
-- `HostKey` is a *request* — the transport task waits for the UI's answer over a oneshot
-  carried in the prompt. Never auto-accept in the transport layer.
+- **Prompts are requests.** The task waits for an answer over a oneshot carried in the
+  prompt. Never auto-accept in the transport layer; §6 says who answers.
 
 ### 3.2 RemoteDesktop
 
@@ -122,15 +134,17 @@ Deliberately parallel to `Transport`, but framebuffer-shaped rather than byte-sh
 This is the substitution seam described in `SPIKE-RDP.md`.
 
 ```rust
-pub trait RemoteDesktop: Send + 'static {
-    fn spawn(self, cfg: RdpConfig) -> Result<RdpHandle, RdpError>;
+pub trait RemoteDesktop: Send + Sync + 'static {
+    fn spawn(&self, rt: &tokio::runtime::Handle, cfg: RdpConfig)
+        -> Result<RdpHandle, RdpError>;
 }
 
+/// Built with `RdpHandle::new_pair()`, like its Transport counterpart.
 pub struct RdpHandle {
     /// Damage-rect updates. Never a full-screen blit unless the server sent one.
     pub frames: mpsc::Receiver<FrameUpdate>,
     pub input:  mpsc::Sender<RdpInput>,
-    pub events: mpsc::Receiver<RdpEvent>,
+    pub events: mpsc::Receiver<RdpEvent>,      // None ⇒ finished
 }
 
 pub struct FrameUpdate {
@@ -149,10 +163,11 @@ pub enum RdpInput {
 
 pub enum RdpEvent {
     Connecting,
-    CertificatePrompt(CertPrompt),
+    Certificate(CertPrompt),          // answer required — §6
+    Credential(CredentialPrompt),     // answer required before NLA — §6
     Connected { width: u16, height: u16 },
     ClipboardFromServer(ClipboardData),
-    Disconnected { reason: String },
+    Disconnected { reason: DisconnectReason },
     Error(RdpError),
 }
 ```
@@ -160,6 +175,9 @@ pub enum RdpEvent {
 `RdpInput::Key` carries a **scancode**, not a character. RDP is scancode-based; going
 through egui's translated character events will break non-US layouts and modifier
 handling. Take raw keyboard input for RDP panes.
+
+Lifecycle semantics are identical to `Transport`: `Disconnected` is a state, `Error`
+means the session continues, and the handle is finished only when `events` closes.
 
 ### 3.3 Session model
 
@@ -223,20 +241,67 @@ texture scaled to the widget rect.
 
 ## 6. Prompts that must reach the user
 
-Host key acceptance, TLS certificate acceptance, password entry, and key passphrase entry
-all originate deep in a background task but must be answered by a human. The pattern:
+Host key acceptance, certificate acceptance, password entry, and key passphrase entry all
+originate deep in a background task but must be answered by a human. The pattern is the
+same for every one of them: the task sends a prompt on `events`, awaits a `oneshot`
+carried inside the prompt, and continues. It never blocks a runtime thread waiting, and
+it never defaults to accept.
 
 ```rust
 pub struct HostKeyPrompt {
     pub host: String,
+    pub port: u16,
+    pub key_type: String,
     pub fingerprint: String,
-    pub known_host_status: KnownHostStatus,
-    pub reply: oneshot::Sender<bool>,
+    pub public_key: Vec<u8>,
+    pub reply: oneshot::Sender<TrustDecision>,   // Reject | AcceptOnce | AcceptAndRemember
+}
+
+pub struct CredentialPrompt {
+    pub request: CredentialRequest,              // Password | Passphrase | KeyboardInteractive
+    pub credential: Option<CredentialRef>,       // where a stored answer would live
+    pub reply: oneshot::Sender<CredentialReply>, // Cancelled | Secret { value, remember } | Responses
 }
 ```
 
-The task sends the prompt on `events`, awaits the oneshot, and continues. The UI renders
-a modal and answers. Never block the runtime thread waiting; never default to accept.
+### 6.1 Who answers
+
+A prompt carries only what the backend knows, and that is less than it looks. The SSH
+crate can report the key a server presented; it cannot say whether that key is in the
+known-hosts store, because the store is `polyterm-store` and backend crates depend on
+`polyterm-core` alone. It can ask for a password; it has no keyring to look in.
+
+So prompts are not answered by the UI directly. They are answered by the binary, which
+has the store, the keyring, and the UI all in reach, and which decides how far each one
+needs to travel:
+
+```
+backend ──HostKey──────► binary looks the key up in the store
+                            Match    ──► reply AcceptOnce; the user never sees it
+                            Unknown  ──► UI modal, KnownHostStatus::Unknown ──► reply
+                            Changed  ──► UI modal, blocking warning (FR-23) ──► reply
+                          AcceptAndRemember ──► the store records the key
+
+backend ──Credential───► binary looks `credential` up in the keyring
+                            hit      ──► reply Secret { remember: false }; no modal
+                            miss     ──► UI modal ──► reply; `remember` ──► keyring writes it
+                            KeyboardInteractive ──► always the UI; never remembered
+```
+
+This is why `known_host_status` is not a field of the prompt: the transport does not know
+it. `KnownHostStatus` is what the binary attaches when a prompt has to go up to the UI.
+
+### 6.2 Consequences
+
+- **`SessionSpec` never needs a secret in it, and no backend ever needs keyring access.**
+  The only path a password travels is keyring → binary → oneshot → backend, inside a
+  `Secret<String>` that cannot be printed and is zeroised on drop.
+- **Keyboard-interactive falls out for free.** The server drives an arbitrary sequence of
+  prompts and each one is a `Credential` event. Nothing special-cases it.
+- **RDP is the same shape.** NLA needs the password before CredSSP proceeds, so the RDP
+  backend emits `Credential` early, and `Certificate` when TLS needs a decision.
+- **`AcceptAndRemember` is a request to the answerer**, not something a backend does.
+  Backends do not write to the known-hosts store or the keyring; they cannot.
 
 ## 7. Persistence
 

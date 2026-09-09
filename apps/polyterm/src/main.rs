@@ -1,9 +1,11 @@
 //! The PolyTerm binary.
 //!
 //! Wiring only — no logic lives here. This is the one crate that names every
-//! backend (ADR-11): it constructs them and hands the resulting
-//! protocol-erased handles to the UI, which never learns which protocol
-//! produced one.
+//! backend (ADR-11): it constructs them, calls `spawn`, and hands the
+//! resulting protocol-erased handles to the UI, which never learns which
+//! protocol produced one. It is also where prompts from backends get answered
+//! — the keyring and the known-hosts store are consulted here, and only what
+//! they cannot settle reaches the user.
 
 mod logging;
 
@@ -15,16 +17,16 @@ use polyterm_serial::SerialTransport;
 use polyterm_ssh::SshTransport;
 use tracing::info;
 
-/// Every byte-stream backend the binary can construct.
+/// Every byte-stream backend the binary links.
 ///
-/// Constructing a transport does no I/O — that is what `spawn` is for — so
-/// this is safe to call at startup and serves as a link-time check that one
-/// `Transport` definition really does fit three different config types.
-fn linked_transports() -> Vec<TransportKind> {
-    vec![
-        SshTransport.kind(),
-        SerialTransport.kind(),
-        PtyTransport.kind(),
+/// Naming the associated const forces each crate to link and each trait impl
+/// to exist, which is the link-time check that one `Transport` definition
+/// really does fit three different config types.
+fn linked_transport_kinds() -> [TransportKind; 3] {
+    [
+        SshTransport::KIND,
+        SerialTransport::KIND,
+        PtyTransport::KIND,
     ]
 }
 
@@ -35,8 +37,10 @@ fn main() -> anyhow::Result<()> {
 
     // ARCHITECTURE.md 1: eframe owns the main thread, and the tokio runtime
     // lives beside it on background threads with only bounded channels
-    // between them. M2 adds the eframe half; for now the runtime is built and
-    // torn down so that the shape is established and the wiring is exercised.
+    // between them. Backends receive `runtime.handle()` at spawn time; nothing
+    // on the main thread ever enters the runtime or blocks on it. M2 adds the
+    // eframe half; for now the runtime is built and torn down so that the
+    // shape is established and the wiring is exercised.
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_name("polyterm-rt")
@@ -44,7 +48,7 @@ fn main() -> anyhow::Result<()> {
         .context("failed to build the tokio runtime")?;
 
     info!(
-        transports = ?linked_transports(),
+        transports = ?linked_transport_kinds(),
         rdp_backend = std::any::type_name::<RdpBackend>(),
         "backends linked"
     );

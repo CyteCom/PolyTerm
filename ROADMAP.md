@@ -8,8 +8,10 @@ criterion is met — the earlier ones establish abstractions the later ones cons
 
 ## M0 — RDP go/no-go spike
 
-**Nothing else starts until this finishes.** It is the entire technical risk in the
-project and it is one day of work.
+**Nothing that depends on the verdict starts until this finishes.** It is the entire
+technical risk in the project and it is one day of work. M1 is the one milestone that does
+not depend on it — the `RemoteDesktop` trait is identical under either answer, which is
+the point of having the trait — and may run alongside. M8 is what waits.
 
 Follow `SPIKE-RDP.md`. Build `ironrdp-viewer` from the upstream repository, point it at
 your real Windows targets with your real GPO security settings, and answer three

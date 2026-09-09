@@ -7,18 +7,22 @@
 
 use std::fmt;
 
+use zeroize::{Zeroize, Zeroizing};
+
 /// A value that must never reach a log, a `Debug` rendering, or the session
-/// store.
+/// store, and that is scrubbed from memory when dropped.
 ///
 /// `Secret` deliberately implements neither `Serialize` nor `Clone`: a secret
 /// that can be serialised will eventually be serialised, and the session store
 /// holds a [`crate::CredentialRef`] naming a keyring entry rather than the
-/// secret itself (ADR-8).
-pub struct Secret<T>(T);
+/// secret itself (ADR-8). There is also no accessor that moves the value out:
+/// that would hand back a plain `String` that is not zeroised on drop, which
+/// defeats the point of wrapping it.
+pub struct Secret<T: Zeroize>(Zeroizing<T>);
 
-impl<T> Secret<T> {
+impl<T: Zeroize> Secret<T> {
     pub fn new(value: T) -> Self {
-        Self(value)
+        Self(Zeroizing::new(value))
     }
 
     /// Borrow the protected value.
@@ -28,26 +32,21 @@ impl<T> Secret<T> {
     pub fn expose(&self) -> &T {
         &self.0
     }
-
-    /// Consume the wrapper and yield the protected value.
-    pub fn into_inner(self) -> T {
-        self.0
-    }
 }
 
-impl<T> fmt::Debug for Secret<T> {
+impl<T: Zeroize> fmt::Debug for Secret<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Secret(<redacted>)")
     }
 }
 
-impl<T> fmt::Display for Secret<T> {
+impl<T: Zeroize> fmt::Display for Secret<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("<redacted>")
     }
 }
 
-impl<T> From<T> for Secret<T> {
+impl<T: Zeroize> From<T> for Secret<T> {
     fn from(value: T) -> Self {
         Self::new(value)
     }
@@ -56,7 +55,9 @@ impl<T> From<T> for Secret<T> {
 /// Substrings that mark a structured-log field name as carrying a secret.
 ///
 /// Matching is on the field *name*, not the value, so this stays cheap enough
-/// to run on every field of every event.
+/// to run on every field of every event. Over-matching is the safe direction:
+/// `credential_ref` names a keyring entry and is harmless to print, and it is
+/// redacted anyway.
 const SECRET_FIELD_MARKERS: &[&str] = &[
     "password",
     "passwd",
@@ -87,9 +88,8 @@ mod tests {
 
     #[test]
     fn debug_does_not_reveal_the_value() {
-        let s = Secret::new("hunter2");
+        let s = Secret::new(String::from("hunter2"));
         assert_eq!(format!("{s:?}"), "Secret(<redacted>)");
-        assert!(!format!("{s:?}").contains("hunter2"));
     }
 
     #[test]
@@ -116,10 +116,11 @@ mod tests {
     }
 
     #[test]
-    fn expose_still_yields_the_value() {
-        let s = Secret::new(42);
-        assert_eq!(*s.expose(), 42);
-        assert_eq!(s.into_inner(), 42);
+    fn expose_yields_the_value_by_reference() {
+        let s = Secret::new(String::from("hunter2"));
+        assert_eq!(s.expose(), "hunter2");
+        let bytes = Secret::new(vec![1u8, 2, 3]);
+        assert_eq!(bytes.expose().as_slice(), &[1, 2, 3]);
     }
 
     #[test]

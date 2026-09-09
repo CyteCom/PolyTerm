@@ -3,20 +3,22 @@
 //! Stub. M5 implements this; M1 only pins the shape.
 
 use polyterm_core::{SshConfig, Transport, TransportError, TransportHandle, TransportKind};
+use tokio::runtime::Handle;
 
 /// An SSH shell session.
+///
+/// One of these is constructed by the binary at startup and opens every
+/// session of its kind for the life of the process.
 #[derive(Debug, Default)]
 pub struct SshTransport;
 
 impl Transport for SshTransport {
     type Config = SshConfig;
 
-    fn spawn(self, _cfg: Self::Config) -> Result<TransportHandle, TransportError> {
-        todo!("M5: implement over russh")
-    }
+    const KIND: TransportKind = TransportKind::Ssh;
 
-    fn kind(&self) -> TransportKind {
-        TransportKind::Ssh
+    fn spawn(&self, _rt: &Handle, _cfg: Self::Config) -> Result<TransportHandle, TransportError> {
+        todo!("M5: implement over russh")
     }
 }
 

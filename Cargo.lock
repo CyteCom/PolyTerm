@@ -173,6 +173,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
@@ -180,6 +181,7 @@ name = "polyterm-pty"
 version = "0.1.0"
 dependencies = [
  "polyterm-core",
+ "tokio",
 ]
 
 [[package]]
@@ -187,6 +189,7 @@ name = "polyterm-rdp"
 version = "0.1.0"
 dependencies = [
  "polyterm-core",
+ "tokio",
 ]
 
 [[package]]
@@ -194,6 +197,7 @@ name = "polyterm-serial"
 version = "0.1.0"
 dependencies = [
  "polyterm-core",
+ "tokio",
 ]
 
 [[package]]
@@ -201,6 +205,7 @@ name = "polyterm-ssh"
 version = "0.1.0"
 dependencies = [
  "polyterm-core",
+ "tokio",
 ]
 
 [[package]]
@@ -561,3 +566,9 @@ checksum = "ae137229bcbd6cdf0f7b80a31df61766145077ddf49416a728b02cb3921ff3fc"
 dependencies = [
  "windows-link",
 ]
+
+[[package]]
+name = "zeroize"
+version = "1.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e13c156562582aa81c60cb29407084cdb54c4164760106ab78e6c5b0858cf64e"

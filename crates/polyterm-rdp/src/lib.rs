@@ -8,13 +8,15 @@
 //! open.
 
 use polyterm_core::{RdpConfig, RdpError, RdpHandle, RemoteDesktop};
+use tokio::runtime::Handle;
 
-/// A remote desktop session.
+/// Opens remote desktop sessions. One of these is constructed by the binary
+/// at startup and opens every RDP session for the life of the process.
 #[derive(Debug, Default)]
 pub struct RdpBackend;
 
 impl RemoteDesktop for RdpBackend {
-    fn spawn(self, _cfg: RdpConfig) -> Result<RdpHandle, RdpError> {
+    fn spawn(&self, _rt: &Handle, _cfg: RdpConfig) -> Result<RdpHandle, RdpError> {
         todo!("M8: implement over the backend chosen by the M0 spike")
     }
 }
