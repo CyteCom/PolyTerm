@@ -43,9 +43,16 @@ modern RDP protocol implementation outside FreeRDP itself. SSH (`russh`), serial
 
 ---
 
-## ADR-2 · Provisional · `ironrdp` as the RDP implementation
+## ADR-2 · Accepted · `ironrdp` as the RDP implementation
 
 **Decision.** Use `ironrdp-client` behind the `RemoteDesktop` trait in `polyterm-core`.
+
+**Accepted 2026-09-09** on the strength of the M0 spike (`SPIKE-RDP.md`). The open gate —
+whether the codec coverage is good enough — was closed empirically: a real authenticated
+session against a Windows Server 2019 host over VPN was pleasant, with crisp small text and
+snappy input, *even though it ran over the legacy bitmap path with no GFX or H.264*. The
+pure-Rust build ships with no H.264 decoder; `openh264-libloading` is held in reserve at no
+cost to NFR-2. NLA verified at runtime on Windows against two hosts. No FreeRDP FFI.
 
 **Why.** It is a pure-Rust RDP implementation from Devolutions with security as its
 stated focus. `ironrdp-client` is factored as a library-only, event-loop-agnostic engine
@@ -70,11 +77,13 @@ question against real target hosts, not a judgement call.
   daemon as a runtime dependency, which defeats NFR-2.
 - **Writing RDP from scratch.** FreeRDP is roughly half a million lines of C. No.
 
-**Revisit if.** `SPIKE-RDP.md` returns a no-go. The fallback is FFI bindings to
-`libfreerdp` via `bindgen`, behind the same trait — losing the pure-Rust property and
-gaining a C build dependency on both platforms, but changing nothing else in the project.
-This is exactly why the trait exists and why it must be defined before any RDP code is
-written.
+**Revisit if.** A real target proves unworkable in a way the spike did not surface — a host
+that only offers the full H.264/AVC444 GFX pipeline and is unusable without it, or the
+`ReactivationTimedOut` dynamic-resize defect turning out to be engine-deep rather than
+viewer front-end behaviour (M8 will tell). The fallback remains FFI bindings to `libfreerdp`
+via `bindgen`, behind the same trait — losing the pure-Rust property and gaining a C build
+dependency on both platforms, but changing nothing else in the project. This is exactly why
+the trait exists and why it was defined before any RDP code was written.
 
 ---
 

@@ -1,13 +1,12 @@
 # SPIKE-RDP.md
 
-**Status: COMPLETE, pending sign-off.** Viewer built on Windows/MSVC; engine crate built
-on Linux/WSL. NLA verified at runtime against a real Server 2019 host over VPN, and the
-subjective test passed (crisp, snappy). **Recommendation: go with `ironrdp`, pure Rust**
-— see *Verdict*. The only thing left is the operator flipping ADR-2 to `Accepted`, which
-is their call.
+**Status: COMPLETE — verdict `ironrdp`, accepted 2026-09-09.** ADR-2 is `Accepted`; M8 is
+unblocked. Viewer built on Windows/MSVC, engine crate on Linux/WSL; NLA verified at runtime
+against a real Server 2019 host over VPN, and the subjective test passed (crisp, snappy).
+See *Verdict*.
 
-This spike resolves ADR-2, which is `Provisional`. It is Milestone M0 and it blocks M8.
-Budget one day.
+This spike resolved ADR-2 (now `Accepted`). It was Milestone M0 and it blocked M8.
+Budget was one day.
 
 ---
 
@@ -296,11 +295,10 @@ enough that the session is unpleasant over your actual network path is.
 
 **Date:** 2026-09-09.
 
-**Recommendation (pending the operator's acceptance — flipping ADR-2 is their call per
-`CLAUDE.md` §8):** **Go with `ironrdp`, pure Rust.** This is the best of the three
-outcomes in the decision rule, and the evidence clears its bar: it connected, NLA worked,
-and thirty-ish minutes of real work over the real VPN path was pleasant, with crisp small
-text and snappy input.
+**Decision: go with `ironrdp`, pure Rust.** Accepted by the operator 2026-09-09; ADR-2 is
+now `Accepted`. This is the best of the three outcomes in the decision rule, and the
+evidence clears its bar: it connected, NLA worked, and real work over the real VPN path was
+pleasant, with crisp small text and snappy input.
 
 **Evidence.**
 
@@ -335,32 +333,27 @@ ADR-2 moves from `Provisional` to `Accepted` once the operator signs off.
 
 ---
 
-## Hand-off: what remains and who does it
+## What M8 inherits from this spike
 
-Done: the Windows build; both credential-free probes (security layer, NLA enforcement, GFX
-advertisement, host identity for hosts 1 and 2); the codec-landscape correction; ADR-2's
-stale premise fixed. The target table rows for 10.0.10.10, 10.166.250.209, and the Ubuntu
-box are filled. What remains needs the Administrator password and a human at the screen.
+M0 is closed. The items below were not fully settled here and are carried into M8 as
+verification work against the real `polyterm-rdp` implementation — none blocked the verdict.
 
-1. **Authenticated session** against 10.166.250.209 (the Win 11 box can't be its own
-   target). Run it yourself so the password never reaches this transcript:
+1. **`ReactivationTimedOut` on dynamic resize.** Reproduced on both runs, even at fixed
+   resolution: the viewer's post-logon display redraw provokes a deactivate/reactivate the
+   Server 2019 host does not complete, forcing a reconnect (which recovers). Almost
+   certainly why the GFX channel never established. It is viewer front-end behaviour, maps
+   to FR-66 (v1.1), and PolyTerm builds its own front-end on the engine — but M8 should
+   confirm the engine itself is not implicated.
+2. **FR-61 certificate prompt.** Untestable with the stock viewer (it defaults to
+   `DangerouslyAcceptInvalidCertificate`). Wire `ironrdp_tls::CertificateValidation::Strict`
+   plus a `CertificateValidationCallback` into `CertPrompt`; never rely on the default.
+3. **FR-62 under a non-US layout** and **FR-64 bidirectional clipboard** — exercise both.
+4. **Linux runtime auth.** The engine crate compiles on Linux; an authenticated connect
+   from Linux (pure-Rust `sspi` CredSSP path) is the one cross-platform check still owed.
 
-   ```powershell
-   $env:RDP_HOSTNAME = "10.166.250.209:3389"
-   $env:RDP_USERNAME = "Administrator"
-   $env:RDP_PASSWORD = Read-Host -AsSecureString | ConvertFrom-SecureString -AsPlainText
-   $env:IRONRDP_LOG  = "info,ironrdp_egfx=debug"
-   ironrdp-viewer --log-file "$env:TEMP\spike-authed.log"
-   ```
-
-   Hand back `spike-authed.log` and the negotiated codec / EGFX line gets read out of it
-   for the table — that part is mechanical.
-2. **Steps 3–5** in the live window: the measurements, the five feature checks (FR-62
-   under your keyboard layout especially), and the thirty minutes of real work that
-   carries the most weight.
-3. **Finish the Linux build**: the one `apt-get` line in step 1, then the rest is
-   unprivileged and can be driven from here.
-4. **Write the verdict.** Update ADR-2 from `Provisional` to `Accepted` (or `Superseded`).
+A reusable artifact worth keeping: `~/Desktop/RDP-Spike.ps1` launches the viewer against
+10.166.250.209 at fixed resolution with codec logging, prompting for the password without
+storing it. Handy for re-checking a host during M8.
 
 ---
 

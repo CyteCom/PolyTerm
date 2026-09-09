@@ -6,7 +6,13 @@ criterion is met — the earlier ones establish abstractions the later ones cons
 
 ---
 
-## M0 — RDP go/no-go spike
+## M0 — RDP go/no-go spike — ✅ DONE (2026-09-09)
+
+**Verdict: go with `ironrdp`, pure Rust.** ADR-2 is `Accepted`. Details in `SPIKE-RDP.md`;
+M8 is unblocked. The residual gaps (FR-61 cert prompt, FR-62 non-US layout, FR-64
+clipboard, a Linux runtime auth test, and the viewer's dynamic-resize reconnect) are M8
+verification items, not spike blockers.
+
 
 **Nothing that depends on the verdict starts until this finishes.** It is the entire
 technical risk in the project and it is one day of work. M1 is the one milestone that does
@@ -19,8 +25,8 @@ questions: does NLA negotiate, does it fall back cleanly when the host wants the
 pipeline, and is the resulting frame rate and text legibility acceptable to a human doing
 actual work.
 
-**Exit:** a written verdict in `SPIKE-RDP.md` — `ironrdp` or `libfreerdp` FFI — with the
-measurements behind it. Update ADR-2 to `Accepted` or `Superseded`.
+**Exit (met):** a written verdict in `SPIKE-RDP.md` — `ironrdp`, with the evidence behind
+it — and ADR-2 moved to `Accepted`.
 
 **Deliberately not built here:** anything reusable. This is throwaway.
 

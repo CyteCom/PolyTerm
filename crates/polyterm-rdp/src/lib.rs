@@ -1,11 +1,12 @@
 //! Remote desktop sessions.
 //!
-//! Stub. M8 implements this, using whichever backend the M0 spike selected.
+//! Stub. M8 implements this over `ironrdp-client` — the backend the M0 spike
+//! selected (ADR-2, `Accepted`; see `SPIKE-RDP.md`).
 //!
-//! This crate deliberately has no RDP dependency yet. ADR-2 is `Provisional`
-//! and `SPIKE-RDP.md` has not run, so committing to `ironrdp-client` here
-//! before the go/no-go would prejudge the decision the trait exists to keep
-//! open.
+//! The RDP dependency is not wired up yet because M8 has not started, not
+//! because the choice is still open: it is settled. When M8 adds
+//! `ironrdp-client` here, it stays behind the `RemoteDesktop` trait so the
+//! `libfreerdp` FFI fallback remains a one-crate change if it is ever needed.
 
 use polyterm_core::{RdpConfig, RdpError, RdpHandle, RemoteDesktop};
 use tokio::runtime::Handle;
