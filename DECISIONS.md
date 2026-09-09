@@ -52,10 +52,14 @@ stated focus. `ironrdp-client` is factored as a library-only, event-loop-agnosti
 that emits output on a channel for an embedder to consume — precisely the shape needed
 for a tabbed session manager. It keeps the single-binary, no-C-dependency property.
 
-**The open gate.** Codec coverage is raw bitmap, interleaved RLE, RDP 6.0 bitmap
-compression, and RemoteFX. It does not cover the full H.264/AVC444 GFX pipeline that
-current Windows hosts prefer. Sessions negotiate down, so they connect, but quality and
-bandwidth efficiency are worse than FreeRDP. Whether that is acceptable is an empirical
+**The open gate.** *Corrected during M0 against upstream `f639145`, 2026-09-09.* The
+Graphics Pipeline (MS-RDPEGFX) is implemented — surfaces, caching, ClearCodec, Planar,
+progressive RemoteFX — and is on by default. H.264 is partial: AVC420 decodes only through
+an optional OpenH264 integration (compiled from C, or Cisco's prebuilt DLL loaded at
+runtime), and AVC444 does not decode at all; upstream deliberately does not advertise it.
+The pure-Rust build therefore negotiates GFX without H.264. That is a far better path than
+the legacy bitmap codecs this ADR originally described, and it widens the decision from
+two options to three (see `SPIKE-RDP.md`). Whether it is good enough is still an empirical
 question against real target hosts, not a judgement call.
 
 **Rejected.**
