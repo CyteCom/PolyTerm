@@ -58,9 +58,9 @@ common way this kind of spike produces a misleading pass.
 
 | # | Host | OS / build | Auth | Security layer | GPO notes |
 |---|---|---|---|---|---|
-| 1 | | Windows 11 | | NLA | |
-| 2 | | Windows Server (session host) | | NLA | |
-| 3 | | Linux `xrdp` | | | |
+| 1 | 10.0.10.10 (`DESKTOP-EV3LKMN`) | Windows 11 24H2, build 26100 | jeffw, password | **`HYBRID_EX`** — confirmed by probe | NLA enforced: a bad credential fails inside CredSSP (`0xC000006D`) before any graphical logon. Server advertises `DYNVC_GFX_PROTOCOL_SUPPORTED` and restricted-admin mode. LAN, sub-millisecond RTT. |
+| 2 | | Windows Server (session host) | | NLA | *none available yet* |
+| 3 | 10.0.10.12 | Ubuntu, OpenSSH 10.2p1 | — | — | **No `xrdp`**: 3389 closed. Becomes a target only if xrdp is installed. |
 | 4 | | *(optional)* Windows 11 over VPN / high latency | | NLA | |
 
 Include at least one host reached over the network path you will actually use. A gigabit
@@ -130,6 +130,35 @@ default filter above keeps the connector at info.
 Note for M8: `polyterm-rdp` must never `Debug`-print the `ironrdp` config it builds. That
 is exactly the NFR-8 hole `Secret<T>` exists to close on our side of the boundary.
 
+#### Results so far — 10.0.10.10, credential-free probe (2026-09-09)
+
+Run with a nonexistent username so nothing could touch a real account's lockout counter.
+Everything below was negotiated before the credential was evaluated, which is why no
+credential was needed to learn it.
+
+- Client offered `SSL | HYBRID | HYBRID_EX`; server selected **`HYBRID_EX`** — CredSSP
+  with early user authorisation, the modern NLA variant Windows 11 picks when NLA is
+  required.
+- Server response flags: `DYNVC_GFX_PROTOCOL_SUPPORTED` (the GFX pipeline will be
+  negotiated once authenticated), `RESTRICTED_ADMIN_MODE_SUPPORTED`,
+  `EXTENDED_CLIENT_DATA_SUPPORTED`.
+- TLS handshake completed and CredSSP ran over it — NTLM NEGOTIATE / CHALLENGE /
+  AUTHENTICATE — then the server returned `STATUS_LOGON_FAILURE (0xC000006D)` *inside*
+  the CredSSP exchange. NLA is enforced; a non-NLA host would have fallen through to the
+  graphical logon.
+- The NTLM CHALLENGE identifies the host as `DESKTOP-EV3LKMN`, Windows 10.0 build
+  **26100** (Windows 11 24H2).
+- Whole negotiation, TCP connect to CredSSP verdict: under one second.
+
+The server certificate was accepted silently; see FR-61 in step 5 for why and what M8
+must do about it.
+
+Still open on this host: the authenticated session — EGFX capability confirmation, codec,
+the measurements, the feature checks. **Constraint found afterwards:** 10.0.10.10 is the
+machine the operator sits at, so it cannot be the subjective-test target from itself; an
+RDP logon as the console user moves that session to the client and locks the console.
+The credential-free results above stand — they describe the host, not the session.
+
 ### 3. Measure
 
 | Metric | How | Bar |
@@ -156,7 +185,7 @@ what the metrics miss, and it is the test that should carry the most weight.
 | Feature | Requirement | Works? | Notes |
 |---|---|---|---|
 | NLA / CredSSP negotiates | FR-60 | | |
-| Certificate prompt on self-signed | FR-61 | | |
+| Certificate prompt on self-signed | FR-61 | **not testable with the stock viewer** | The library default is `DangerouslyAcceptInvalidCertificate` and the viewer does not override it, so the probe crossed a self-signed certificate with no prompt and no log line. The library does provide `CertificateValidation::Strict` and a `CertificateValidationCallback`, which is exactly the hook `CertPrompt` needs. M8: set `Strict` plus the callback and never rely on the default. |
 | Non-US keyboard layout, modifiers, extended keys | FR-62 | | |
 | Mouse: all buttons + wheel | FR-63 | | |
 | Clipboard, both directions, text | FR-64 | | |
