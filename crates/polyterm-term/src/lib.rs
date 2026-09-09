@@ -7,7 +7,8 @@
 //!
 //! The engine is an implementation detail. Nothing in the public API names
 //! `alacritty_terminal`, so swapping it for `wezterm-term` (ADR-4) touches only
-//! [`terminal`]. The UI and the tests speak the vocabulary in [`snapshot`].
+//! the `terminal` module. The UI and the tests speak the vocabulary of
+//! [`Snapshot`] and its parts.
 //!
 //! ```
 //! use polyterm_term::{GridSize, Terminal};
