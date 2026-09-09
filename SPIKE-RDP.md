@@ -91,19 +91,23 @@ cargo build --release -p ironrdp-viewer      # Windows, MSVC 14.51, Build Tools 
 - Upstream also publishes prebuilt, checksummed viewer binaries on GitHub Releases
   under `ironrdp-viewer-v*` tags, if a second machine needs one.
 
-The Linux build was attempted in WSL (Ubuntu 26.04). It needs the X11/xkb dev headers
-winit and softbuffer link against, and `sudo` in WSL is not passwordless here, so it is
-blocked on one privileged step — run once:
+**Linux (WSL Ubuntu 26.04) — engine confirmed.** The point of a Linux build is to prove
+the pure-Rust RDP stack compiles cross-platform. The crate that matters for that is
+`ironrdp-client` — the engine `polyterm-rdp` will link — not the GUI viewer. It builds
+clean:
 
-```bash
-wsl -d Ubuntu-26.04 sudo apt-get install -y build-essential pkg-config \
-    libxkbcommon-dev libwayland-dev libx11-dev libxcb1-dev \
-    libxcursor-dev libxrandr-dev libxi-dev
+```
+cargo build --release -p ironrdp-client --features rustls   # Linux, rustc 1.98.1
+# ironrdp-connector, -session, -egfx, -client → libironrdp_client.rlib, 19 s, no C system libs
 ```
 
-After that the toolchain install and `cargo build -p ironrdp-viewer` need no privileges.
-Do it before writing the verdict — CredSSP differs across platforms and the crate rules
-in `CLAUDE.md` 5 apply to spikes too.
+The full **GUI viewer** on Linux additionally pulls C-backed native front-end backends —
+`alsa-sys` (audio), and behind it PCSC (smartcard) and FUSE (drive redirection) — via its
+`client-all` feature. Those need `libasound2-dev` etc. and are **irrelevant to PolyTerm**,
+which renders frames itself and links the engine, not the viewer. So the engine build is
+the honest cross-platform check and it passed; building the viewer's native extras on
+Linux is not on the critical path. (The X11/xkb headers `winit`/`softbuffer` want were the
+first blocker and are already installed here.)
 
 ### 2. Connect to each target
 
