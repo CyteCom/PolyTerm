@@ -1,0 +1,19 @@
+# LF in the repository and LF in the working tree, on every platform. This
+# overrides core.autocrlf, so a Windows checkout and a Linux checkout produce
+# byte-identical files -- which matters here because both are first-class build
+# and test targets, not a primary and a port.
+* text=auto eol=lf
+
+# The exception: cmd.exe batch parsing is not reliably LF-safe.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary assets -- never transform. Fonts are listed because the terminal
+# renderer ships its own (ARCHITECTURE.md 4, glyph atlas).
+*.png   binary
+*.jpg   binary
+*.ico   binary
+*.ttf   binary
+*.otf   binary
+*.woff  binary
+*.woff2 binary
