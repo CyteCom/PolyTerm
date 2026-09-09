@@ -1,0 +1,57 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # Fail fast on a dependency that cannot be fetched rather than retrying for
+  # minutes.
+  CARGO_NET_RETRY: 2
+
+jobs:
+  fmt:
+    name: rustfmt
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all -- --check
+
+  # NFR-1 and the platform-parity rule in CLAUDE.md 5: Linux and Windows are
+  # both first-class. A Linux pass does not imply a Windows pass, so both run
+  # on every push and neither is allowed to fail quietly.
+  check:
+    name: clippy + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      # M3 adds serialport, which needs libudev on Linux, and M2 adds eframe,
+      # which needs the X11/Wayland development headers. Neither is a
+      # dependency yet; add the apt step here when they land.
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: test
+        run: cargo test --workspace

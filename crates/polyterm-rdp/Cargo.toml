@@ -1,0 +1,14 @@
+[package]
+name = "polyterm-rdp"
+description = "RemoteDesktop implementation. Backend selected by the M0 spike."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polyterm-core = { path = "../polyterm-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+[package]
+name = "polyterm-ssh"
+description = "Transport implementation over russh, plus SFTP and port forwarding."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polyterm-core = { path = "../polyterm-core" }
+
+[lints]
+workspace = true

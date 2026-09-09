@@ -1,0 +1,8 @@
+msrv = "1.85"
+
+# CLAUDE.md 5: nothing may block the thread eframe owns. This catches the most
+# common way that rule gets broken by accident. Blocking calls belong on the
+# tokio runtime or behind spawn_blocking.
+disallowed-methods = [
+    { path = "std::thread::sleep", reason = "blocks the calling thread; on the UI thread this breaks NFR-4. Use tokio::time::sleep on the runtime, or spawn_blocking." },
+]

@@ -1,0 +1,16 @@
+[package]
+name = "polyterm-ui"
+description = "egui shell: tiles, tabs, session tree, terminal and RDP panes."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polyterm-core = { path = "../polyterm-core" }
+polyterm-store = { path = "../polyterm-store" }
+polyterm-term = { path = "../polyterm-term" }
+
+[lints]
+workspace = true

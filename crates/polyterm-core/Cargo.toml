@@ -1,0 +1,18 @@
+[package]
+name = "polyterm-core"
+description = "Session model, error types, and the Transport and RemoteDesktop contracts."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+uuid = { workspace = true }
+
+[lints]
+workspace = true

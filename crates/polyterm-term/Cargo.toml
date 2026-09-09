@@ -1,0 +1,14 @@
+[package]
+name = "polyterm-term"
+description = "VT engine: wraps alacritty_terminal, owns the grid, exposes a renderable snapshot."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+polyterm-core = { path = "../polyterm-core" }
+
+[lints]
+workspace = true

@@ -1,0 +1,28 @@
+[package]
+name = "polyterm"
+description = "Cross-platform SSH, serial, local shell, and RDP connection manager."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# The only crate that knows every backend exists. It constructs them and hands
+# the resulting protocol-erased handles to the UI (ADR-11).
+[dependencies]
+polyterm-core = { path = "../../crates/polyterm-core" }
+polyterm-pty = { path = "../../crates/polyterm-pty" }
+polyterm-rdp = { path = "../../crates/polyterm-rdp" }
+polyterm-serial = { path = "../../crates/polyterm-serial" }
+polyterm-ssh = { path = "../../crates/polyterm-ssh" }
+polyterm-store = { path = "../../crates/polyterm-store" }
+polyterm-term = { path = "../../crates/polyterm-term" }
+polyterm-ui = { path = "../../crates/polyterm-ui" }
+
+anyhow = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true
