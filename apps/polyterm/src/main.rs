@@ -22,9 +22,9 @@ use tracing::info;
 /// `Transport` definition really does fit three different config types.
 fn linked_transports() -> Vec<TransportKind> {
     vec![
-        SshTransport::default().kind(),
-        SerialTransport::default().kind(),
-        PtyTransport::default().kind(),
+        SshTransport.kind(),
+        SerialTransport.kind(),
+        PtyTransport.kind(),
     ]
 }
 

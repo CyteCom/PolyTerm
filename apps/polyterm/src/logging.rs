@@ -10,7 +10,6 @@
 //! field names are secret — lives in the core crate, so both halves agree.
 
 use std::fmt;
-use std::fmt::Write as _;
 
 use polyterm_core::is_secret_field;
 use tracing::field::{Field, Visit};
