@@ -45,9 +45,15 @@ connection or a slow RDP host from freezing the whole application.
                    └────────► apps/polyterm ◄─┘
 ```
 
-`polyterm-core` is the only shared vocabulary. Backends implement its traits; the UI
-consumes them as `Box<dyn Transport>` / `Box<dyn RemoteDesktop>`. The binary is the sole
-place where a concrete backend type is named.
+`polyterm-core` is the only shared vocabulary. Backends implement its traits; the binary
+calls `spawn` and hands the UI the resulting `TransportHandle` / `RdpHandle`, which are
+concrete and carry no trace of which protocol produced them. The binary is the sole place
+where a concrete backend type is named.
+
+Neither trait is object-safe, and neither needs to be: `spawn` consumes `self`, and
+`Transport` carries an associated `Config` type, so `Box<dyn Transport>` does not compile.
+Erasure happens at the handle, not at the trait. The handles are already uniform, which is
+what the UI actually needs — see §3.1.
 
 The purpose of the layering is substitutability. Swapping `ironrdp` for FFI bindings to
 `libfreerdp`, or `alacritty_terminal` for `wezterm-term`, must touch exactly one crate.

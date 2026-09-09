@@ -99,7 +99,8 @@ apps/
 3. `polyterm-ui` depends on `-core`, `-term`, and `-store`. It **must not** name
    `russh`, `serialport`, `portable-pty`, or `ironrdp` in its `Cargo.toml`.
 4. `apps/polyterm` is the only crate that knows every backend exists. It constructs
-   them and hands trait objects to the UI.
+   them, calls `spawn`, and hands the UI the resulting `TransportHandle` / `RdpHandle`.
+   Erasure is at the handle; the traits themselves are not object-safe.
 
 If a task seems to require breaking one of these, the design is wrong. Stop and say so.
 
