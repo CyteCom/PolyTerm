@@ -8,9 +8,9 @@
 //!
 //! A pane's id is a fresh [`SessionId`] minted per *open*, not the id of the
 //! saved session it came from — FR-2 allows the same saved session to be open
-//! in several tabs at once, and each must be an independent instance. (Linking
-//! an instance back to its saved session, for FR-95 restore, is a later
-//! concern.)
+//! in several tabs at once, and each must be an independent instance. Each
+//! instance's reopen source (a saved id, or an inline spec) is recorded
+//! alongside for FR-95 restore; see [`PaneSource`].
 //!
 //! Sessions are opened through a [`SessionSpawner`]: the UI holds one but never
 //! names a backend crate (ADR-11). It hands a [`SessionSpec`] to the spawner,
@@ -44,10 +44,43 @@ use polyterm_core::{
     BoxError, FolderPath, PtyConfig, SessionId, SessionKind, SessionSpec, TransportHandle,
 };
 use polyterm_store::SessionStore;
+use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use crate::palette::Theme;
 use crate::pane::{LivePane, encode_key};
+
+/// Storage key for the persisted tile layout (FR-95).
+const LAYOUT_KEY: &str = "polyterm_layout";
+/// Storage key for the restore-on-startup opt-in (FR-4).
+const RESTORE_KEY: &str = "polyterm_restore_enabled";
+
+/// How to reopen a pane on restart (FR-95). A pane's tree key is a throwaway
+/// instance id; this is the durable part — enough to bring the session back.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+enum PaneSource {
+    /// A saved session, reopened by looking its id up in the store. If it has
+    /// been deleted, the leaf is dropped on restore (§10.1). Edits to the saved
+    /// session are therefore picked up.
+    Saved(SessionId),
+    /// An ad-hoc session (a local shell, a split, the startup session), which
+    /// has no store entry, so its spec is carried inline. Boxed because a
+    /// `SessionSpec` dwarfs the `Saved` variant. No secret lives here —
+    /// `SessionSpec` holds only credential *references* (ADR-8).
+    Adhoc(Box<SessionSpec>),
+}
+
+/// The persisted layout: the tile tree, how to reopen each of its panes, and
+/// which tile held focus (FR-95). Multi-exec is deliberately absent — it is
+/// never restored as enabled.
+#[derive(Serialize, Deserialize)]
+struct PersistedLayout {
+    tree: Tree<SessionId>,
+    /// Instance id → how to reopen it. A `Vec` rather than a map so it
+    /// serialises cleanly in any format.
+    sources: Vec<(SessionId, PaneSource)>,
+    focused: Option<TileId>,
+}
 
 /// Opens a live session for a saved spec without the UI naming any backend
 /// (ADR-11). The binary implements this — it is the one crate that knows every
@@ -71,6 +104,7 @@ enum PanelAction {
     OpenLocalShell,
     OpenSaved(SessionId),
     Refresh,
+    SetRestore(bool),
 }
 
 /// Which way to split a tile: `Right` puts the new pane beside the current one
@@ -90,6 +124,10 @@ pub struct TerminalApp {
     /// the tree so the tree can serialise (FR-95) and so a broadcast can fan
     /// out over many panes without aliasing the tree.
     live: HashMap<SessionId, LivePane>,
+    /// How to reopen each live pane on restart, keyed by its instance id
+    /// (FR-95). Kept in step with [`Self::live`]: an entry is added when a pane
+    /// opens and dropped when it closes.
+    sources: HashMap<SessionId, PaneSource>,
     /// The tile that keyboard input reaches (FR-90). Normally a pane leaf.
     focused: Option<TileId>,
     /// Tiles with broadcast (multi-exec) enabled (ADR-13). Empty until the
@@ -108,6 +146,8 @@ pub struct TerminalApp {
     sessions: Vec<SessionSpec>,
     /// Whether the session panel is shown. Forced on while nothing is open.
     show_panel: bool,
+    /// Whether to restore the tile layout on startup (FR-4 opt-in). Persisted.
+    restore_enabled: bool,
     /// The last open error, shown in the panel until the next successful open.
     last_error: Option<String>,
 
@@ -189,11 +229,13 @@ impl Perf {
 const FRAME_WINDOW: usize = 120;
 
 impl TerminalApp {
-    /// Wire the UI to a spawner and open the initial session as the first pane.
-    /// A failed initial open is not fatal: the window comes up with the panel
-    /// and an error, ready to open something else.
+    /// Wire the UI to a spawner. If restore is opted in (FR-4) and a saved
+    /// layout is present, rebuild it (FR-95); otherwise open `initial` as the
+    /// first pane. A failed open is not fatal: the window comes up with the
+    /// panel and an error, ready to open something else.
     pub fn new(
         ctx: &egui::Context,
+        storage: Option<&dyn eframe::Storage>,
         rt: Handle,
         spawner: Arc<dyn SessionSpawner>,
         store: Option<SessionStore>,
@@ -203,10 +245,14 @@ impl TerminalApp {
             .as_ref()
             .and_then(|s| s.list_sessions().ok())
             .unwrap_or_default();
+        let restore_enabled = storage
+            .and_then(|s| eframe::get_value::<bool>(s, RESTORE_KEY))
+            .unwrap_or(false);
 
         let mut app = Self {
             tree: Tree::empty(egui::Id::new("polyterm_tiles")),
             live: HashMap::new(),
+            sources: HashMap::new(),
             focused: None,
             multi_exec: HashSet::new(),
             spawner,
@@ -214,44 +260,113 @@ impl TerminalApp {
             store,
             sessions,
             show_panel: true,
+            restore_enabled,
             last_error: None,
             theme: Theme::default(),
             font_size: 15.0,
             applied_title: String::new(),
             perf: std::env::var_os("POLYTERM_PERF").map(|_| Perf::new()),
         };
-        app.open_session(ctx, &initial);
+
+        // Restore the saved layout only when opted in and one is present and at
+        // least one pane comes back; otherwise fall back to the initial session.
+        let restored = restore_enabled
+            && storage
+                .and_then(|s| eframe::get_value::<PersistedLayout>(s, LAYOUT_KEY))
+                .is_some_and(|layout| app.restore(ctx, layout));
+        if !restored {
+            app.open_in_new_tab(ctx, PaneSource::Adhoc(Box::new(initial)));
+        }
         app
     }
 
-    /// Spawn `spec` and register its live terminal, returning the fresh pane
-    /// instance id. A fresh id per call is why opening the same saved session
-    /// twice is two independent panes (FR-2). Does not touch the layout — the
-    /// caller decides whether the pane becomes a tab or a split. On failure,
-    /// records the error for the panel and returns `None`.
-    fn make_live(&mut self, ctx: &egui::Context, spec: &SessionSpec) -> Option<SessionId> {
-        match self.spawner.spawn(spec) {
+    /// Resolve `source` to a spec, spawn it, and register the live terminal at
+    /// instance id `instance`, recording how to reopen it (FR-95). Returns
+    /// whether it succeeded. Does not touch the layout — the caller decides
+    /// whether the pane becomes a tab, a split, or fills a restored leaf. On
+    /// failure, records the error for the panel.
+    fn open_source(
+        &mut self,
+        ctx: &egui::Context,
+        instance: SessionId,
+        source: PaneSource,
+    ) -> bool {
+        let spec = match &source {
+            PaneSource::Adhoc(spec) => Some(spec.as_ref().clone()),
+            PaneSource::Saved(id) => self
+                .store
+                .as_ref()
+                .and_then(|s| s.get_session(*id).ok().flatten()),
+        };
+        let Some(spec) = spec else {
+            // The saved session is gone (or the store is unavailable).
+            self.last_error = Some("A saved session no longer exists.".to_owned());
+            return false;
+        };
+        match self.spawner.spawn(&spec) {
             Ok(handle) => {
-                let instance = SessionId::new();
                 let pane = LivePane::new(ctx, &self.rt, handle, spec.name.clone());
                 self.live.insert(instance, pane);
+                self.sources.insert(instance, source);
                 self.last_error = None;
-                Some(instance)
+                true
             }
             Err(e) => {
                 tracing::warn!(error = %e, session = %spec.name, "could not open session");
                 self.last_error = Some(format!("Could not open {}: {e}", spec.name));
-                None
+                false
             }
         }
     }
 
-    /// Open `spec` as a new tab and focus it (FR-2).
-    fn open_session(&mut self, ctx: &egui::Context, spec: &SessionSpec) {
-        if let Some(instance) = self.make_live(ctx, spec) {
+    /// Spawn `source` at a fresh instance id (a fresh id per call is why opening
+    /// the same saved session twice is two independent panes, FR-2). Returns the
+    /// instance id, or `None` on failure.
+    fn make_live(&mut self, ctx: &egui::Context, source: PaneSource) -> Option<SessionId> {
+        let instance = SessionId::new();
+        self.open_source(ctx, instance, source).then_some(instance)
+    }
+
+    /// Open `source` as a new tab and focus it (FR-2).
+    fn open_in_new_tab(&mut self, ctx: &egui::Context, source: PaneSource) {
+        if let Some(instance) = self.make_live(ctx, source) {
             let leaf = attach_pane(&mut self.tree, instance);
             self.focused = Some(leaf);
         }
+    }
+
+    /// Rebuild a persisted layout (FR-95): adopt the tree, then reopen each pane
+    /// from its recorded source. A leaf whose session cannot be reopened — the
+    /// saved session was deleted, or a device is gone — is dropped, and the rest
+    /// still load (§10.1). Returns whether any pane came back.
+    fn restore(&mut self, ctx: &egui::Context, layout: PersistedLayout) -> bool {
+        self.tree = layout.tree;
+        let sources: HashMap<SessionId, PaneSource> = layout.sources.into_iter().collect();
+        let leaves: Vec<(TileId, SessionId)> = self
+            .tree
+            .tiles
+            .iter()
+            .filter_map(|(id, tile)| match tile {
+                Tile::Pane(instance) => Some((*id, *instance)),
+                Tile::Container(_) => None,
+            })
+            .collect();
+
+        let mut any = false;
+        for (tile, instance) in leaves {
+            let opened = sources
+                .get(&instance)
+                .cloned()
+                .is_some_and(|source| self.open_source(ctx, instance, source));
+            if opened {
+                any = true;
+            } else {
+                self.close_tile(tile);
+            }
+        }
+        self.focused = layout.focused;
+        self.validate_focus();
+        any
     }
 
     /// Split the tile at `at` (a focused pane leaf), opening a fresh local shell
@@ -260,7 +375,9 @@ impl TerminalApp {
         let Some(existing) = self.tree.tiles.get_pane(&at).copied() else {
             return;
         };
-        if let Some(new_instance) = self.make_live(ctx, &local_shell_spec()) {
+        if let Some(new_instance) =
+            self.make_live(ctx, PaneSource::Adhoc(Box::new(local_shell_spec())))
+        {
             let new_leaf = split_tile(&mut self.tree, existing, new_instance, at, dir);
             self.focused = Some(new_leaf);
         }
@@ -274,6 +391,7 @@ impl TerminalApp {
         for removed in self.tree.remove_recursively(tile) {
             if let Tile::Pane(id) = removed {
                 self.live.remove(&id);
+                self.sources.remove(&id);
             }
         }
         if was_root {
@@ -296,13 +414,12 @@ impl TerminalApp {
 
     fn apply_panel_action(&mut self, ctx: &egui::Context, action: PanelAction) {
         match action {
-            PanelAction::OpenLocalShell => self.open_session(ctx, &local_shell_spec()),
-            PanelAction::OpenSaved(id) => {
-                if let Some(spec) = self.sessions.iter().find(|s| s.id == id).cloned() {
-                    self.open_session(ctx, &spec);
-                }
+            PanelAction::OpenLocalShell => {
+                self.open_in_new_tab(ctx, PaneSource::Adhoc(Box::new(local_shell_spec())))
             }
+            PanelAction::OpenSaved(id) => self.open_in_new_tab(ctx, PaneSource::Saved(id)),
             PanelAction::Refresh => self.reload_sessions(),
+            PanelAction::SetRestore(enabled) => self.restore_enabled = enabled,
         }
     }
 
@@ -471,6 +588,13 @@ impl TerminalApp {
         }
 
         ui.separator();
+        let mut restore = self.restore_enabled;
+        if ui
+            .checkbox(&mut restore, "Restore layout on startup")
+            .changed()
+        {
+            actions.push(PanelAction::SetRestore(restore));
+        }
         ui.weak("Ctrl+Shift+E toggles this panel.");
         actions
     }
@@ -514,6 +638,9 @@ impl TerminalApp {
         if let Some(tile) = close_req {
             self.close_tile(tile);
         }
+        // Drop reopen-sources for panes closed via a tab's own close button
+        // (which egui_tiles removed from `live` during the draw).
+        self.sources.retain(|id, _| self.live.contains_key(id));
         self.validate_focus();
         self.perf_overlay(ui, ctx);
     }
@@ -615,6 +742,21 @@ impl eframe::App for TerminalApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.draw_content(ui, &ctx));
+    }
+
+    /// Persist the layout and the restore opt-in (FR-95). eframe calls this on
+    /// exit and on an auto-save timer, so whatever the tree is at save time —
+    /// structure, split ratios, active tabs, focus — is captured, with no need
+    /// to track when it changed. Multi-exec is never written, so it can never
+    /// be restored as enabled.
+    fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        eframe::set_value(storage, RESTORE_KEY, &self.restore_enabled);
+        let layout = PersistedLayout {
+            tree: self.tree.clone(),
+            sources: self.sources.iter().map(|(k, v)| (*k, v.clone())).collect(),
+            focused: self.focused,
+        };
+        eframe::set_value(storage, LAYOUT_KEY, &layout);
     }
 }
 
@@ -881,6 +1023,36 @@ mod tests {
             !got.contains(&b),
             "a split must not reach the sibling tab (FR-90)"
         );
+    }
+
+    #[test]
+    fn a_persisted_layout_round_trips_through_serde() {
+        // FR-95: the tree structure, the reopen source of each pane, and the
+        // focused tile all survive a save/restore cycle.
+        let mut tree = empty_tree();
+        let (a, b) = (SessionId::new(), SessionId::new());
+        attach_pane(&mut tree, a);
+        let lb = attach_pane(&mut tree, b);
+        let layout = PersistedLayout {
+            tree,
+            sources: vec![
+                (a, PaneSource::Adhoc(Box::new(local_shell_spec()))),
+                (b, PaneSource::Saved(SessionId::new())),
+            ],
+            focused: Some(lb),
+        };
+
+        let json = serde_json::to_string(&layout).unwrap();
+        let back: PersistedLayout = serde_json::from_str(&json).unwrap();
+
+        let mut ids = Vec::new();
+        if let Some(root) = back.tree.root {
+            collect_session_ids(&back.tree.tiles, root, &mut ids);
+        }
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a) && ids.contains(&b));
+        assert_eq!(back.sources.len(), 2);
+        assert_eq!(back.focused, Some(lb));
     }
 
     #[test]

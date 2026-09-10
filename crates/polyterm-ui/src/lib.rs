@@ -55,6 +55,7 @@ pub fn run(
         Box::new(move |cc| {
             Ok(Box::new(TerminalApp::new(
                 &cc.egui_ctx,
+                cc.storage,
                 rt,
                 spawner,
                 store,

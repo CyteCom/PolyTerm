@@ -365,10 +365,16 @@ struct TabGroup {
 ```
 
 This lives in `polyterm-ui`. It is presentation state, not session state: `polyterm-core`
-knows about sessions, not about where they sit on screen. `polyterm-store` persists a
-serialised form of the tree (FR-95) alongside the session tree, referencing sessions by
-`SessionId`. A restored layout naming a session that no longer exists drops that leaf and
-loads the rest; it does not fail the restore.
+knows about sessions, not about where they sit on screen, and `polyterm-store` holds no
+UI-shaped data. The tree is presentation, so it persists through the UI's own storage
+(`eframe`'s persisted key-value store, auto-saved on a timer and on exit — FR-95), not
+through `polyterm-store`. Each leaf is a throwaway *instance* id paired with a durable
+reopen source: either a saved `SessionId` (reopened from the store, so edits show and a
+deleted session drops the leaf) or an inline `SessionSpec` for an ad-hoc pane such as a
+local shell or a split. A restored leaf whose session cannot be reopened is dropped and the
+rest still load; the restore never fails. No secret is written — a `SessionSpec` carries
+only credential references (ADR-8). Focus is persisted; multi-exec is deliberately not, so
+it can never be restored as enabled (FR-95).
 
 The tree above is the **conceptual model**; the implementation realizes it with
 `egui_tiles` 0.17.1 (DECISIONS ADR-12). `egui_tiles` generalises the binary split into an

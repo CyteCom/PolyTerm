@@ -2952,6 +2952,8 @@ dependencies = [
  "polyterm-core",
  "polyterm-store",
  "polyterm-term",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
 ]

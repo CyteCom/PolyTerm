@@ -18,6 +18,12 @@ tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 jiff = { workspace = true }
+# Persisting the tile layout (FR-95) through eframe's storage.
+serde = { workspace = true }
+
+[dev-dependencies]
+# Round-trip test for the persisted layout.
+serde_json = { workspace = true }
 
 [lints]
 workspace = true
