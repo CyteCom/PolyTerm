@@ -16,6 +16,9 @@ pub struct Theme {
     pub cursor: Color32,
     /// Background of selected cells.
     pub selection: Color32,
+    /// The unmistakable mark for broadcast (multi-exec): the border of a
+    /// receiving pane and the title of a receiving tab (FR-93).
+    pub broadcast: Color32,
     /// ANSI colours 0–15 (8 normal, 8 bright).
     pub ansi: [Color32; 16],
 }
@@ -28,6 +31,7 @@ impl Default for Theme {
             background: Color32::from_rgb(0x14, 0x14, 0x18),
             cursor: Color32::from_rgb(0xd0, 0xd0, 0xd0),
             selection: Color32::from_rgb(0x33, 0x44, 0x66),
+            broadcast: Color32::from_rgb(0xff, 0x8c, 0x00),
             ansi: [
                 Color32::from_rgb(0x1c, 0x1c, 0x1c), // 0 black
                 Color32::from_rgb(0xd7, 0x5f, 0x5f), // 1 red

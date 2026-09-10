@@ -130,8 +130,10 @@ pub struct TerminalApp {
     sources: HashMap<SessionId, PaneSource>,
     /// The tile that keyboard input reaches (FR-90). Normally a pane leaf.
     focused: Option<TileId>,
-    /// Tiles with broadcast (multi-exec) enabled (ADR-13). Empty until the
-    /// broadcast toggle UI lands; keyboard then reaches only the focused pane.
+    /// Container tiles with broadcast (multi-exec) enabled (ADR-13), toggled per
+    /// group from a pane's context menu. Keystrokes typed into a pane inside an
+    /// enabled tile reach that tile's whole subtree; otherwise the focused pane
+    /// alone. Never persisted, so it never restores as enabled (FR-95).
     multi_exec: HashSet<TileId>,
 
     /// How new sessions are opened (ADR-11); implemented by the binary.
@@ -433,22 +435,24 @@ impl TerminalApp {
     }
 
     /// The set of sessions this frame's keystrokes should reach (§10.2, ADR-13).
-    /// With broadcast off, the focused pane alone; with it on for the focused
-    /// tile, every pane in that tile's subtree.
     fn recipients(&self) -> Vec<SessionId> {
-        let Some(focused) = self.focused else {
-            return Vec::new();
-        };
-        let mut out = Vec::new();
-        collect_session_ids(&self.tree.tiles, focused, &mut out);
-        if !self.multi_exec.contains(&focused) {
-            // Isolated delivery: the focused pane only. Focus normally rests on
-            // a leaf, so the walk already yielded exactly one; truncating is a
-            // guard for the unusual case of a focused container with broadcast
-            // off.
-            out.truncate(1);
+        match self.focused {
+            Some(focused) => resolve_recipients(&self.tree.tiles, &self.multi_exec, focused),
+            None => Vec::new(),
         }
-        out
+    }
+
+    /// Every session currently receiving broadcast input: the union of the
+    /// subtrees of all broadcast-enabled tiles. Used to mark them (FR-93).
+    fn receiving_sessions(&self) -> HashSet<SessionId> {
+        let mut set = HashSet::new();
+        let mut buf = Vec::new();
+        for &tile in &self.multi_exec {
+            buf.clear();
+            collect_session_ids(&self.tree.tiles, tile, &mut buf);
+            set.extend(buf.iter().copied());
+        }
+        set
     }
 
     /// If focus no longer points at a live pane (its tab was closed), move it
@@ -604,23 +608,43 @@ impl TerminalApp {
     /// its context menu can request a split or close.
     fn draw_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let multi = self.live.len() > 1;
+        // Precomputed while the tree is free to borrow: which sessions are
+        // receiving broadcast (to mark them), and the group each leaf's toggle
+        // would target (its parent — a UI-time lookup, never used in delivery).
+        let receiving = self.receiving_sessions();
+        let leaves: Vec<TileId> = self
+            .tree
+            .tiles
+            .iter()
+            .filter_map(|(id, tile)| matches!(tile, Tile::Pane(_)).then_some(*id))
+            .collect();
+        let toggle_targets: HashMap<TileId, Option<TileId>> = leaves
+            .iter()
+            .map(|&id| (id, self.tree.tiles.parent_of(id)))
+            .collect();
+
         let paint_start = self.perf.is_some().then(Instant::now);
-        let (focus_req, split_req, close_req) = {
+        let (focus_req, split_req, close_req, broadcast_req) = {
             let mut behavior = TermBehavior {
                 live: &mut self.live,
                 theme: &self.theme,
                 font_size: self.font_size,
                 focused: self.focused,
                 show_focus: multi,
+                multi_exec: &self.multi_exec,
+                receiving: &receiving,
+                toggle_targets: &toggle_targets,
                 focus_request: None,
                 split_request: None,
                 close_request: None,
+                broadcast_request: None,
             };
             self.tree.ui(&mut behavior, ui);
             (
                 behavior.focus_request,
                 behavior.split_request,
                 behavior.close_request,
+                behavior.broadcast_request,
             )
         };
         if let Some(start) = paint_start
@@ -638,9 +662,19 @@ impl TerminalApp {
         if let Some(tile) = close_req {
             self.close_tile(tile);
         }
+        // Toggle broadcast on the requested group (FR-91). A deliberate act,
+        // never a side effect of a layout change (FR-93).
+        if let Some(tile) = broadcast_req
+            && !self.multi_exec.remove(&tile)
+        {
+            self.multi_exec.insert(tile);
+        }
         // Drop reopen-sources for panes closed via a tab's own close button
-        // (which egui_tiles removed from `live` during the draw).
+        // (which egui_tiles removed from `live` during the draw), and forget
+        // broadcast flags for tiles the layout no longer has.
         self.sources.retain(|id, _| self.live.contains_key(id));
+        self.multi_exec
+            .retain(|tile| self.tree.tiles.get(*tile).is_some());
         self.validate_focus();
         self.perf_overlay(ui, ctx);
     }
@@ -771,21 +805,31 @@ struct TermBehavior<'a> {
     focused: Option<TileId>,
     /// Whether to outline the focused pane — only worth it with more than one.
     show_focus: bool,
+    /// Broadcast-enabled tiles, for labelling the context-menu toggle (FR-91).
+    multi_exec: &'a HashSet<TileId>,
+    /// Sessions receiving broadcast input, for marking them (FR-93).
+    receiving: &'a HashSet<SessionId>,
+    /// Per-leaf: the parent container a "broadcast to group" toggle targets.
+    /// Precomputed so the context menu need not consult the borrowed tree.
+    toggle_targets: &'a HashMap<TileId, Option<TileId>>,
     /// The tile the pointer interacted with this frame, if any.
     focus_request: Option<TileId>,
     /// A split requested from a pane's context menu this frame (FR-85).
     split_request: Option<(TileId, SplitDir)>,
     /// A close requested from a pane's context menu this frame (FR-87).
     close_request: Option<TileId>,
+    /// A broadcast toggle requested this frame: the tile to flip (FR-91).
+    broadcast_request: Option<TileId>,
 }
 
 impl Behavior<SessionId> for TermBehavior<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, tile_id: TileId, pane: &mut SessionId) -> UiResponse {
         let draw_focus = self.show_focus && self.focused == Some(tile_id);
+        let broadcasting = self.receiving.contains(pane);
         // Confine the live-pane borrow to this block; it yields the Response so
         // focus and the context menu can be handled without holding it.
         let response = if let Some(live) = self.live.get_mut(pane) {
-            Some(live.show(ui, self.theme, self.font_size, draw_focus))
+            Some(live.show(ui, self.theme, self.font_size, draw_focus, broadcasting))
         } else {
             None
         };
@@ -793,8 +837,11 @@ impl Behavior<SessionId> for TermBehavior<'_> {
             if response.clicked() || response.drag_started() || response.dragged() {
                 self.focus_request = Some(tile_id);
             }
-            // Right-click a pane to split or close it — the affordance that
-            // works even for a lone full-window pane, which has no tab bar.
+            // The group a broadcast toggle would target: this pane's parent.
+            let group = self.toggle_targets.get(&tile_id).copied().flatten();
+            // Right-click a pane to split, broadcast, or close it — the
+            // affordance that works even for a lone full-window pane, which has
+            // no tab bar.
             response.context_menu(|ui| {
                 if ui.button("Split right").clicked() {
                     self.split_request = Some((tile_id, SplitDir::Right));
@@ -803,6 +850,17 @@ impl Behavior<SessionId> for TermBehavior<'_> {
                 if ui.button("Split down").clicked() {
                     self.split_request = Some((tile_id, SplitDir::Down));
                     ui.close();
+                }
+                if let Some(group) = group {
+                    let label = if self.multi_exec.contains(&group) {
+                        "Stop broadcasting to group"
+                    } else {
+                        "Broadcast input to group"
+                    };
+                    if ui.button(label).clicked() {
+                        self.broadcast_request = Some(group);
+                        ui.close();
+                    }
                 }
                 ui.separator();
                 if ui.button("Close").clicked() {
@@ -823,6 +881,27 @@ impl Behavior<SessionId> for TermBehavior<'_> {
             .map(|l| l.label().to_owned())
             .unwrap_or_default()
             .into()
+    }
+
+    /// Mark a receiving tab in the broadcast colour so a background tab that is
+    /// getting input is unmistakable, not just the visible pane (FR-93).
+    fn tab_text_color(
+        &self,
+        visuals: &egui::Visuals,
+        tiles: &Tiles<SessionId>,
+        tile_id: TileId,
+        state: &egui_tiles::TabState,
+    ) -> Color32 {
+        if let Some(session) = tiles.get_pane(&tile_id)
+            && self.receiving.contains(session)
+        {
+            return self.theme.broadcast;
+        }
+        if state.active {
+            visuals.widgets.active.text_color()
+        } else {
+            visuals.widgets.noninteractive.text_color()
+        }
     }
 
     fn is_tab_closable(&self, _tiles: &Tiles<SessionId>, _tile_id: TileId) -> bool {
@@ -923,6 +1002,44 @@ fn collect_session_ids(tiles: &Tiles<SessionId>, tile: TileId, out: &mut Vec<Ses
         }
         None => {}
     }
+}
+
+/// Whether `target` lies in `root`'s subtree, checked by walking *down* from
+/// `root`. Used to decide which broadcast tile a focused leaf belongs to
+/// without ever consulting a parent pointer (§10.2).
+fn subtree_contains(tiles: &Tiles<SessionId>, root: TileId, target: TileId) -> bool {
+    root == target
+        || matches!(tiles.get(root), Some(Tile::Container(c))
+            if c.children().any(|&child| subtree_contains(tiles, child, target)))
+}
+
+/// Resolve the recipient set for keystrokes typed into `focused` (§10.2,
+/// ADR-13). If `focused` sits inside a broadcast-enabled tile, deliver to that
+/// tile's whole subtree; otherwise to `focused` alone. Both are pure downward
+/// walks — the isolation is the traversal, never a filter over a global list,
+/// and no parent pointer is followed. When enabled tiles nest around `focused`,
+/// the smallest (innermost) wins, so delivery never widens past the tightest
+/// enclosing broadcast group.
+fn resolve_recipients(
+    tiles: &Tiles<SessionId>,
+    multi_exec: &HashSet<TileId>,
+    focused: TileId,
+) -> Vec<SessionId> {
+    let mut best: Option<Vec<SessionId>> = None;
+    for &tile in multi_exec {
+        if subtree_contains(tiles, tile, focused) {
+            let mut out = Vec::new();
+            collect_session_ids(tiles, tile, &mut out);
+            if best.as_ref().is_none_or(|b| out.len() < b.len()) {
+                best = Some(out);
+            }
+        }
+    }
+    best.unwrap_or_else(|| {
+        let mut out = Vec::new();
+        collect_session_ids(tiles, focused, &mut out);
+        out
+    })
 }
 
 #[cfg(test)]
@@ -1053,6 +1170,67 @@ mod tests {
         assert!(ids.contains(&a) && ids.contains(&b));
         assert_eq!(back.sources.len(), 2);
         assert_eq!(back.focused, Some(lb));
+    }
+
+    /// Build `horizontal[ tabs{A, B}, C ]`, returning the tiles, the sessions
+    /// `(a, b, c)`, and the tile ids `(pa, pb, pc, tabs, root)`.
+    #[allow(clippy::type_complexity)]
+    fn split_and_tabs() -> (
+        Tiles<SessionId>,
+        (SessionId, SessionId, SessionId),
+        (TileId, TileId, TileId, TileId, TileId),
+    ) {
+        let mut tiles: Tiles<SessionId> = Tiles::default();
+        let (a, b, c) = (SessionId::new(), SessionId::new(), SessionId::new());
+        let pa = tiles.insert_pane(a);
+        let pb = tiles.insert_pane(b);
+        let pc = tiles.insert_pane(c);
+        let tabs = tiles.insert_tab_tile(vec![pa, pb]);
+        let root = tiles.insert_horizontal_tile(vec![tabs, pc]);
+        (tiles, (a, b, c), (pa, pb, pc, tabs, root))
+    }
+
+    #[test]
+    fn without_broadcast_only_the_focused_pane_receives() {
+        let (tiles, (a, _b, _c), (pa, ..)) = split_and_tabs();
+        assert_eq!(resolve_recipients(&tiles, &HashSet::new(), pa), vec![a]);
+    }
+
+    #[test]
+    fn broadcast_reaches_the_whole_enabled_group_but_no_further() {
+        // Enable broadcast on the tab group; typing in either tab reaches both
+        // A and B, never the sibling C (FR-91 + FR-90).
+        let (tiles, (a, b, c), (pa, pb, pc, tabs, _root)) = split_and_tabs();
+        let on = HashSet::from([tabs]);
+
+        let from_a = resolve_recipients(&tiles, &on, pa);
+        assert_eq!(from_a.len(), 2);
+        assert!(from_a.contains(&a) && from_a.contains(&b) && !from_a.contains(&c));
+        // Same set from the other tab in the group.
+        let from_b = resolve_recipients(&tiles, &on, pb);
+        assert_eq!(from_b.len(), 2);
+
+        // Focusing the pane outside the enabled tile broadcasts to nobody else.
+        assert_eq!(resolve_recipients(&tiles, &on, pc), vec![c]);
+    }
+
+    #[test]
+    fn nested_broadcast_prefers_the_innermost_group() {
+        // With both the whole window and the inner tab group enabled, typing in
+        // the tab group reaches only it — never wider than the tightest group.
+        let (tiles, (a, b, c), (pa, _pb, _pc, tabs, root)) = split_and_tabs();
+        let on = HashSet::from([root, tabs]);
+        let r = resolve_recipients(&tiles, &on, pa);
+        assert_eq!(r.len(), 2);
+        assert!(r.contains(&a) && r.contains(&b) && !r.contains(&c));
+    }
+
+    #[test]
+    fn subtree_contains_walks_downward_only() {
+        let (tiles, _, (pa, _pb, pc, tabs, root)) = split_and_tabs();
+        assert!(subtree_contains(&tiles, tabs, pa));
+        assert!(!subtree_contains(&tiles, tabs, pc));
+        assert!(subtree_contains(&tiles, root, pc));
     }
 
     #[test]

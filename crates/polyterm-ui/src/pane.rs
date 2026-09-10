@@ -279,13 +279,15 @@ impl LivePane {
     /// return the `Response` over its area — the caller reads it to move focus
     /// here on interaction (FR-90) and to attach a context menu. `draw_focus`
     /// outlines the pane when it is the focused one and more than one is on
-    /// screen.
+    /// screen; `broadcasting` marks it when it is receiving multi-exec input
+    /// (FR-93).
     pub(crate) fn show(
         &mut self,
         ui: &mut egui::Ui,
         theme: &Theme,
         font_size: f32,
         draw_focus: bool,
+        broadcasting: bool,
     ) -> egui::Response {
         let ctx = ui.ctx().clone();
         let font = FontId::monospace(font_size);
@@ -355,16 +357,16 @@ impl LivePane {
         self.modem_readout(ui, avail, cell_h);
         self.log_indicator(ui, avail, cell_h);
 
+        // A pane receiving broadcast input is unmistakably marked (FR-93): a
+        // thick border in the broadcast colour, inset so it reads distinctly
+        // from the focus ring even when a pane is both focused and receiving.
+        if broadcasting {
+            inset_border(ui, avail, 2.0, 2.0, theme.broadcast);
+        }
+        // A thin inset ring in the cursor colour marks the focused pane — the
+        // one keystrokes reach when broadcast is off (FR-90).
         if draw_focus {
-            // A thin inset ring in the cursor colour marks the focused pane —
-            // the one keystrokes reach (FR-90). Drawn with lines so it needs no
-            // version-specific stroke-kind plumbing.
-            let s = egui::Stroke::new(1.5, theme.cursor);
-            let p = ui.painter();
-            p.hline(avail.left()..=avail.right(), avail.top() + 0.75, s);
-            p.hline(avail.left()..=avail.right(), avail.bottom() - 0.75, s);
-            p.vline(avail.left() + 0.75, avail.top()..=avail.bottom(), s);
-            p.vline(avail.right() - 0.75, avail.top()..=avail.bottom(), s);
+            inset_border(ui, avail, 0.75, 1.5, theme.cursor);
         }
 
         response
@@ -690,6 +692,17 @@ fn selection_text(selection: Selection, snapshot: &Snapshot) -> Option<String> {
     } else {
         Some(joined)
     }
+}
+
+/// Draw a rectangular border inset by `inset` pixels, `width` thick, in
+/// `color`. Uses lines so it needs no version-specific stroke-kind plumbing.
+fn inset_border(ui: &egui::Ui, rect: Rect, inset: f32, width: f32, color: Color32) {
+    let s = egui::Stroke::new(width, color);
+    let p = ui.painter();
+    p.hline(rect.left()..=rect.right(), rect.top() + inset, s);
+    p.hline(rect.left()..=rect.right(), rect.bottom() - inset, s);
+    p.vline(rect.left() + inset, rect.top()..=rect.bottom(), s);
+    p.vline(rect.right() - inset, rect.top()..=rect.bottom(), s);
 }
 
 /// Map a pixel position to a grid cell, clamped to the grid.
