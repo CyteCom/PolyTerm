@@ -10,6 +10,9 @@
 //! `request_repaint` from small relay tasks rather than by polling. Nothing on
 //! this thread ever blocks on the runtime.
 
+use std::collections::VecDeque;
+use std::time::Instant;
+
 use bytes::Bytes;
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Sense, Vec2};
 use polyterm_core::{ControlMsg, TransportEvent, TransportHandle};
@@ -77,7 +80,66 @@ pub struct TerminalApp {
     /// The title currently applied to the window, so it is set only on change.
     applied_title: String,
     disconnected: bool,
+
+    /// Frame-time instrumentation, on when `POLYTERM_PERF` is set. Draws an FPS
+    /// overlay and repaints continuously so the renderer runs flat out — for
+    /// measuring against NFR-5, not for normal use.
+    perf: Option<Perf>,
 }
+
+#[derive(Debug)]
+struct Perf {
+    last_frame: Option<Instant>,
+    /// Recent frame intervals in milliseconds (bounded ring).
+    frame_ms: VecDeque<f32>,
+    /// Recent `paint()` durations in milliseconds — the renderer's own cost,
+    /// isolated from the vsync-capped frame interval.
+    paint_ms: VecDeque<f32>,
+    /// Bytes fed to the terminal since the last throughput sample.
+    bytes: usize,
+    last_report: Instant,
+}
+
+impl Perf {
+    fn new() -> Self {
+        Self {
+            last_frame: None,
+            frame_ms: VecDeque::with_capacity(FRAME_WINDOW),
+            paint_ms: VecDeque::with_capacity(FRAME_WINDOW),
+            bytes: 0,
+            last_report: Instant::now(),
+        }
+    }
+
+    fn record_paint(&mut self, ms: f32) {
+        if self.paint_ms.len() == FRAME_WINDOW {
+            self.paint_ms.pop_front();
+        }
+        self.paint_ms.push_back(ms);
+    }
+
+    fn avg_paint_ms(&self) -> f32 {
+        let n = self.paint_ms.len().max(1) as f32;
+        self.paint_ms.iter().sum::<f32>() / n
+    }
+
+    /// Record a frame and return the rolling average interval in ms.
+    fn tick(&mut self) -> f32 {
+        let now = Instant::now();
+        if let Some(prev) = self.last_frame.replace(now) {
+            let ms = (now - prev).as_secs_f32() * 1000.0;
+            if self.frame_ms.len() == FRAME_WINDOW {
+                self.frame_ms.pop_front();
+            }
+            self.frame_ms.push_back(ms);
+        }
+        let n = self.frame_ms.len().max(1) as f32;
+        self.frame_ms.iter().sum::<f32>() / n
+    }
+}
+
+/// How many recent frames the rolling average covers.
+const FRAME_WINDOW: usize = 120;
 
 impl TerminalApp {
     /// Wire a terminal to a spawned transport. Spawns the relay tasks that carry
@@ -132,6 +194,7 @@ impl TerminalApp {
             title: "polyterm".to_owned(),
             applied_title: String::new(),
             disconnected: false,
+            perf: std::env::var_os("POLYTERM_PERF").map(|_| Perf::new()),
         }
     }
 
@@ -154,6 +217,9 @@ impl TerminalApp {
     fn pump_output(&mut self) {
         let mut got_output = false;
         while let Ok(chunk) = self.output.try_recv() {
+            if let Some(perf) = self.perf.as_mut() {
+                perf.bytes += chunk.len();
+            }
             self.terminal.feed(&chunk);
             got_output = true;
         }
@@ -335,7 +401,56 @@ impl eframe::App for TerminalApp {
         self.handle_pointer(&ctx, &response, &snapshot, avail.min, cell_w, cell_h);
         self.handle_keyboard(&ctx, &snapshot);
 
+        let paint_start = self.perf.is_some().then(Instant::now);
         self.paint(ui, avail.min, cell_w, cell_h, &font, &snapshot);
+        if let (Some(start), Some(perf)) = (paint_start, self.perf.as_mut()) {
+            perf.record_paint(start.elapsed().as_secs_f32() * 1000.0);
+        }
+
+        self.perf_overlay(ui, avail, cell_h);
+    }
+}
+
+impl TerminalApp {
+    /// Draw the FPS overlay and drive continuous repaint while measuring.
+    fn perf_overlay(&mut self, ui: &egui::Ui, avail: Rect, cell_h: f32) {
+        let Some(perf) = self.perf.as_mut() else {
+            return;
+        };
+        let avg_ms = perf.tick();
+        let fps = if avg_ms > 0.0 { 1000.0 / avg_ms } else { 0.0 };
+
+        // Throughput since the last one-second sample.
+        let paint_ms = perf.avg_paint_ms();
+        let elapsed = perf.last_report.elapsed().as_secs_f32();
+        if elapsed >= 1.0 {
+            let mib_s = perf.bytes as f32 / elapsed / (1024.0 * 1024.0);
+            tracing::info!(
+                fps = fps,
+                frame_ms = avg_ms,
+                paint_ms = paint_ms,
+                throughput_mib_s = mib_s,
+                "perf"
+            );
+            perf.bytes = 0;
+            perf.last_report = Instant::now();
+        }
+
+        let text = format!("{fps:>3.0} fps  paint {paint_ms:>4.1} ms");
+        let pos = Pos2::new(avail.right() - 8.0, avail.top() + 4.0);
+        let painter = ui.painter();
+        let font = FontId::monospace((cell_h * 0.8).max(10.0));
+        // Backed by a chip so it stays readable over any content.
+        let galley = painter.layout_no_wrap(text, font, Color32::WHITE);
+        let rect = Align2::RIGHT_TOP
+            .anchor_size(pos, galley.size())
+            .expand(3.0);
+        painter.rect_filled(rect, 2.0, Color32::from_black_alpha(180));
+        painter.galley(rect.min + Vec2::new(3.0, 3.0), galley, Color32::WHITE);
+
+        // Keep the frame loop running flat out so the average reflects the
+        // renderer's real cost, not the idle repaint cadence.
+        ui.ctx().request_repaint();
     }
 }
 

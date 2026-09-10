@@ -218,14 +218,29 @@ sequence, assert on the resulting grid.
 
 Rendering constraints:
 
-- Maintain a glyph atlas. Do not ask egui to lay out text per cell per frame. One atlas
-  per font configuration, shared by every live terminal — not one per pane.
-- Use `alacritty_terminal`'s damage information to redraw only changed lines.
 - Cursor blink and selection highlight are UI state, not terminal state.
 - Scrollback lives in the `Term`, not in the UI.
 
-Full-grid redraw every frame will not survive `cat` of a large file at 60 fps. Build
-damage tracking in from the start.
+**Glyph atlas — measured, not assumed (M2, 2026).** This section originally required a
+bespoke glyph atlas and per-line damage-driven repaint, on the assumption that laying out
+text per cell per frame would not survive a `cat`. Measurement retired that assumption.
+`egui` already maintains its own font atlas and caches the galley for each
+(glyph, font, colour); the per-cell `painter.text` path is therefore a cache hit plus a
+shape push, not a re-layout. On a maximised 5120×1440 window — roughly 40,000 cells,
+fully changed every frame while streaming a 10 MB file — building the whole frame's shapes
+costs **~0.9 ms**, and the app holds a steady 60 fps with no dropped frames. NFR-5 wants
+30 fps; the budget is 33 ms and we use under one.
+
+So a custom atlas is **not** built: `egui`'s atlas is the shared atlas this section asked
+for, and building our own would be premature optimisation. If a future case (a much faster
+source, or a pathological grid) ever pushes the renderer, the fallback is a single
+`Mesh` of textured quads over `egui`'s font-atlas UVs — but only when a measurement, taken
+with the `POLYTERM_PERF` instrumentation in `polyterm-ui`, shows it is needed.
+
+Immediate-mode rendering re-tessellates the whole frame regardless, so per-line damage
+buys nothing on a repaint; damage's value is elsewhere — the UI repaints only when data
+arrives (woken by `request_repaint`), not on a clock, so an idle terminal costs nothing.
+`polyterm-term` still exposes damage in its snapshot for any consumer that can use it.
 
 ## 5. Rendering RDP
 

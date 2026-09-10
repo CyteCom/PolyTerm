@@ -70,6 +70,13 @@ correctly. `cat` a 10 MB file and hold 30 fps (NFR-5). Select and copy text. Res
 window and have everything stay correct. `polyterm-term` has headless unit tests
 (NFR-10).
 
+**Progress.** Done and verified: local shell, terminal render, keyboard input, resize,
+scrollback, selection + copy (FR-14), and **NFR-5** — measured at ~0.9 ms/frame shape
+build, a steady 60 fps streaming a 10 MB file on a maximised 5120×1440 grid (see
+`ARCHITECTURE.md` §4; the custom glyph atlas proved unnecessary). Still owed before the
+milestone closes: `vim`/`htop`/`tmux` correctness, which needs mouse reporting (FR-13),
+and the Linux side of the manual exercise.
+
 **Requirements:** FR-10 through FR-17, FR-55, FR-56, NFR-5, NFR-10.
 
 ---
