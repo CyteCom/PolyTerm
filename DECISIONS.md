@@ -355,3 +355,48 @@ sysfs data proves too thin to tell two adapters apart in practice.
 
 **Consequence.** CI needs no `libudev-dev`. Windows and macOS are unaffected — their
 backends are target-gated, not behind this feature.
+
+---
+
+## ADR-15 · Accepted · The `SessionSpawner` boundary opens sessions
+
+**Decision.** The UI opens a session by handing a `SessionSpec` to a
+`SessionSpawner` — a trait defined in `polyterm-ui` and implemented by
+`apps/polyterm`. The binary matches the spec's kind to a backend, calls
+`Transport::spawn`, and returns the protocol-erased `TransportHandle`. The UI
+holds the spawner as `Arc<dyn SessionSpawner>` and never names a backend crate.
+
+**Why.** ADR-11 forbids the UI from naming `russh`, `serialport`,
+`portable-pty`, or `ironrdp`, yet the UI is where a session is opened (a click
+in the session tree, FR-1/FR-2). Something must cross that gap. The `Transport`
+trait itself is not object-safe (associated `Config`, associated `KIND`), so the
+UI cannot hold a `dyn Transport`. A one-method, object-safe spawner is the
+narrowest possible seam: the UI expresses *what* to open (a `SessionSpec`, a
+`polyterm-core` type that holds no secret) and the binary decides *how*. It also
+keeps the erasure exactly where ADR-11/§4 already put it — at the handle.
+
+**Where it lives.** In `polyterm-ui`, not `polyterm-core`. Both the UI (caller)
+and the binary (implementer) can see it there, and it is a UI-consumption
+contract, not part of the transport vocabulary. This keeps `polyterm-core`
+unchanged — no new core trait — while respecting the dependency layering.
+
+**Rejected.**
+
+- **A `dyn Transport` in the UI.** Not object-safe, and it would drag the
+  backend's `Config` type into the UI regardless.
+- **A `SessionSpawner` in `polyterm-core`.** Core would then reference
+  `TransportHandle` construction on behalf of the UI for no gain; the contract
+  is consumed at the UI boundary, so it belongs there.
+- **The UI depending on the backend crates directly behind `#[cfg]`.** A flat
+  violation of ADR-11, and it defeats the point of the erased handle.
+
+**Consequence.** A failed *initial* open is no longer a fatal binary error; it
+surfaces in the UI (the session panel shows the error) exactly as a later open
+would, which is both more consistent and better UX than exiting. RDP has no
+place here — it is a `RemoteDesktop`/`RdpHandle`, not a `Transport`, so the
+spawner reports it unsupported until M8 gives RDP its own pane type.
+
+**Revisit if.** Opening needs to be asynchronous at the call site (today it
+returns a handle immediately and progress arrives as events). If a backend ever
+needs to do blocking work before it can hand back a handle, the spawner returns
+a future instead — a signature change, not a design change.

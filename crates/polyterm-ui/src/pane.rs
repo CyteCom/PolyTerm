@@ -96,13 +96,23 @@ pub(crate) struct LivePane {
     /// The session's current title, as set by the far end (OSC 0/2). The app
     /// reflects the focused pane's title into the window title.
     title: String,
+    /// The stable label for this pane's tab: the session's name, or "Local
+    /// shell" for an ad-hoc one. Unlike [`Self::title`] it does not change as
+    /// programs set the terminal title, so a tab stays recognisable.
+    label: String,
     disconnected: bool,
 }
 
 impl LivePane {
     /// Wire a live terminal to a spawned transport. Spawns the relay tasks that
     /// carry the transport's output and events to the UI and wake it on arrival.
-    pub(crate) fn new(ctx: &egui::Context, rt: &Handle, handle: TransportHandle) -> Self {
+    /// `label` is the stable tab title (the session's name).
+    pub(crate) fn new(
+        ctx: &egui::Context,
+        rt: &Handle,
+        handle: TransportHandle,
+        label: String,
+    ) -> Self {
         let TransportHandle {
             mut output,
             input,
@@ -152,13 +162,20 @@ impl LivePane {
             buttons_down: 0,
             last_report_cell: None,
             title: "polyterm".to_owned(),
+            label,
             disconnected: false,
         }
     }
 
-    /// The session's current title.
+    /// The session's current title, as set by the far end (drives the window
+    /// title).
     pub(crate) fn title(&self) -> &str {
         &self.title
+    }
+
+    /// The stable tab label (the session's name).
+    pub(crate) fn label(&self) -> &str {
+        &self.label
     }
 
     /// Drain lifecycle events and transport output into the terminal, and
