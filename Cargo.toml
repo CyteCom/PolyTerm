@@ -64,7 +64,8 @@ ironrdp-client = "0.1"        # (unused until M8)
 
 # --- storage & config --------------------------------------------------------
 rusqlite     = { version = "0.40", features = ["bundled"] }  # (unused until M4)
-keyring      = "4"            # (unused until M4)
+keyring      = "4"
+keyring-core = "1"            # (unused until M4)
 directories  = "6"            # (unused until M4)
 serde        = { version = "1", features = ["derive"] }
 serde_json   = "1"            # (unused until M4)

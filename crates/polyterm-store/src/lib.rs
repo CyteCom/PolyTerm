@@ -1,9 +1,10 @@
 //! Persistence.
 //!
-//! Owns the session tree in SQLite under the platform config directory (ADR-9).
-//! Credential access through the OS keyring (ADR-8) is a separate module, added
-//! next; the store holds only a [`CredentialRef`](polyterm_core::CredentialRef),
-//! never a secret.
+//! Owns two things: the session tree in SQLite under the platform config
+//! directory (ADR-9), and credential access through the OS keyring (ADR-8, the
+//! [`credentials`] module). The store holds only a
+//! [`CredentialRef`](polyterm_core::CredentialRef); the secret lives in the
+//! keyring, never in SQLite.
 //!
 //! SQLite rather than a JSON file because the tree grows, needs partial updates
 //! a row at a time, and must survive an unclean shutdown — properties a
@@ -14,6 +15,7 @@
 
 #![forbid(unsafe_code)]
 
+pub mod credentials;
 mod store;
 
 pub use store::SessionStore;
@@ -35,4 +37,14 @@ pub enum StoreError {
 
     #[error("i/o error")]
     Io(#[from] std::io::Error),
+
+    /// The OS keyring failed or is unavailable. Upstream should fall back to
+    /// prompting for the secret, never to a weaker store (ADR-8).
+    #[error("keyring error")]
+    Keyring(#[from] keyring_core::Error),
+
+    /// The keyring could not be initialised (no credential store on this
+    /// platform, or it failed to open). Same fallback: prompt (ADR-8).
+    #[error("keyring initialisation failed: {0}")]
+    KeyringInit(String),
 }
