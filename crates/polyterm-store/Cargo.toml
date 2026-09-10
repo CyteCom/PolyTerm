@@ -9,6 +9,12 @@ repository.workspace = true
 
 [dependencies]
 polyterm-core = { path = "../polyterm-core" }
+rusqlite = { workspace = true }
+directories = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
 
 [lints]
 workspace = true
