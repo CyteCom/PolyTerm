@@ -275,17 +275,18 @@ impl LivePane {
         }
     }
 
-    /// Draw the pane into its tile's `ui` and handle its own pointer input.
-    /// Returns `true` if the pointer interacted with it this frame, so the app
-    /// can move keyboard focus here (FR-90). `draw_focus` outlines the pane when
-    /// it is the focused one and more than one is on screen.
+    /// Draw the pane into its tile's `ui`, handle its own pointer input, and
+    /// return the `Response` over its area — the caller reads it to move focus
+    /// here on interaction (FR-90) and to attach a context menu. `draw_focus`
+    /// outlines the pane when it is the focused one and more than one is on
+    /// screen.
     pub(crate) fn show(
         &mut self,
         ui: &mut egui::Ui,
         theme: &Theme,
         font_size: f32,
         draw_focus: bool,
-    ) -> bool {
+    ) -> egui::Response {
         let ctx = ui.ctx().clone();
         let font = FontId::monospace(font_size);
         // Measure the monospace cell by laying out one glyph. Version-robust and
@@ -295,7 +296,9 @@ impl LivePane {
             .layout_no_wrap("M".to_owned(), font.clone(), Color32::WHITE);
         let (cell_w, cell_h) = (cell.size().x, cell.size().y);
         if cell_w <= 0.0 || cell_h <= 0.0 {
-            return false;
+            // Degenerate font metrics: nothing to draw. Still hand back a
+            // response over the area so the caller has one to work with.
+            return ui.allocate_rect(ui.available_rect_before_wrap(), Sense::hover());
         }
 
         // Is the application driving the mouse (FR-13)? Holding Shift always
@@ -364,7 +367,7 @@ impl LivePane {
             p.vline(avail.right() - 0.75, avail.top()..=avail.bottom(), s);
         }
 
-        response.clicked() || response.drag_started() || response.dragged()
+        response
     }
 
     /// Update the selection from this frame's pointer interaction, and copy on

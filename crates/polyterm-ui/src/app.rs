@@ -73,6 +73,14 @@ enum PanelAction {
     Refresh,
 }
 
+/// Which way to split a tile: `Right` puts the new pane beside the current one
+/// (a horizontal row), `Down` puts it below (a vertical column). FR-85.
+#[derive(Debug, Clone, Copy)]
+enum SplitDir {
+    Right,
+    Down,
+}
+
 /// The whole application: the layout tree, the live terminals it references,
 /// the means to open more, and the shared render state.
 pub struct TerminalApp {
@@ -216,24 +224,60 @@ impl TerminalApp {
         app
     }
 
-    /// Open `spec` as a new pane and focus it. On failure, record the error for
-    /// the panel and leave the layout unchanged.
-    fn open_session(&mut self, ctx: &egui::Context, spec: &SessionSpec) {
+    /// Spawn `spec` and register its live terminal, returning the fresh pane
+    /// instance id. A fresh id per call is why opening the same saved session
+    /// twice is two independent panes (FR-2). Does not touch the layout — the
+    /// caller decides whether the pane becomes a tab or a split. On failure,
+    /// records the error for the panel and returns `None`.
+    fn make_live(&mut self, ctx: &egui::Context, spec: &SessionSpec) -> Option<SessionId> {
         match self.spawner.spawn(spec) {
             Ok(handle) => {
-                // A fresh instance id: opening the same saved session twice is
-                // two independent panes (FR-2).
                 let instance = SessionId::new();
                 let pane = LivePane::new(ctx, &self.rt, handle, spec.name.clone());
                 self.live.insert(instance, pane);
-                let leaf = attach_pane(&mut self.tree, instance);
-                self.focused = Some(leaf);
                 self.last_error = None;
+                Some(instance)
             }
             Err(e) => {
                 tracing::warn!(error = %e, session = %spec.name, "could not open session");
                 self.last_error = Some(format!("Could not open {}: {e}", spec.name));
+                None
             }
+        }
+    }
+
+    /// Open `spec` as a new tab and focus it (FR-2).
+    fn open_session(&mut self, ctx: &egui::Context, spec: &SessionSpec) {
+        if let Some(instance) = self.make_live(ctx, spec) {
+            let leaf = attach_pane(&mut self.tree, instance);
+            self.focused = Some(leaf);
+        }
+    }
+
+    /// Split the tile at `at` (a focused pane leaf), opening a fresh local shell
+    /// in the new half, and focus it (FR-85). No-op if `at` is not a pane.
+    fn apply_split(&mut self, ctx: &egui::Context, at: TileId, dir: SplitDir) {
+        let Some(existing) = self.tree.tiles.get_pane(&at).copied() else {
+            return;
+        };
+        if let Some(new_instance) = self.make_live(ctx, &local_shell_spec()) {
+            let new_leaf = split_tile(&mut self.tree, existing, new_instance, at, dir);
+            self.focused = Some(new_leaf);
+        }
+    }
+
+    /// Close the pane at `tile`, dropping its live terminal (which shuts the
+    /// backend down) and healing the tree — egui_tiles promotes the sibling so
+    /// no hole is left (FR-87). Closing the last pane empties the tree.
+    fn close_tile(&mut self, tile: TileId) {
+        let was_root = self.tree.root == Some(tile);
+        for removed in self.tree.remove_recursively(tile) {
+            if let Tile::Pane(id) = removed {
+                self.live.remove(&id);
+            }
+        }
+        if was_root {
+            self.tree.root = None;
         }
     }
 
@@ -432,11 +476,12 @@ impl TerminalApp {
     }
 
     /// Draw the tile content: every pane sizes to its own rect, draws itself,
-    /// and handles its own pointer input; a pointer interaction focuses it.
+    /// and handles its own pointer input; a pointer interaction focuses it, and
+    /// its context menu can request a split or close.
     fn draw_content(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         let multi = self.live.len() > 1;
         let paint_start = self.perf.is_some().then(Instant::now);
-        {
+        let (focus_req, split_req, close_req) = {
             let mut behavior = TermBehavior {
                 live: &mut self.live,
                 theme: &self.theme,
@@ -444,14 +489,30 @@ impl TerminalApp {
                 focused: self.focused,
                 show_focus: multi,
                 focus_request: None,
+                split_request: None,
+                close_request: None,
             };
             self.tree.ui(&mut behavior, ui);
-            if let Some(request) = behavior.focus_request {
-                self.focused = Some(request);
-            }
-        }
-        if let (Some(start), Some(perf)) = (paint_start, self.perf.as_mut()) {
+            (
+                behavior.focus_request,
+                behavior.split_request,
+                behavior.close_request,
+            )
+        };
+        if let Some(start) = paint_start
+            && let Some(perf) = self.perf.as_mut()
+        {
             perf.record_paint(start.elapsed().as_secs_f32() * 1000.0);
+        }
+
+        if let Some(request) = focus_req {
+            self.focused = Some(request);
+        }
+        if let Some((tile, dir)) = split_req {
+            self.apply_split(ctx, tile, dir);
+        }
+        if let Some(tile) = close_req {
+            self.close_tile(tile);
         }
         self.validate_focus();
         self.perf_overlay(ui, ctx);
@@ -570,15 +631,43 @@ struct TermBehavior<'a> {
     show_focus: bool,
     /// The tile the pointer interacted with this frame, if any.
     focus_request: Option<TileId>,
+    /// A split requested from a pane's context menu this frame (FR-85).
+    split_request: Option<(TileId, SplitDir)>,
+    /// A close requested from a pane's context menu this frame (FR-87).
+    close_request: Option<TileId>,
 }
 
 impl Behavior<SessionId> for TermBehavior<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, tile_id: TileId, pane: &mut SessionId) -> UiResponse {
         let draw_focus = self.show_focus && self.focused == Some(tile_id);
-        if let Some(live) = self.live.get_mut(pane)
-            && live.show(ui, self.theme, self.font_size, draw_focus)
-        {
-            self.focus_request = Some(tile_id);
+        // Confine the live-pane borrow to this block; it yields the Response so
+        // focus and the context menu can be handled without holding it.
+        let response = if let Some(live) = self.live.get_mut(pane) {
+            Some(live.show(ui, self.theme, self.font_size, draw_focus))
+        } else {
+            None
+        };
+        if let Some(response) = response {
+            if response.clicked() || response.drag_started() || response.dragged() {
+                self.focus_request = Some(tile_id);
+            }
+            // Right-click a pane to split or close it — the affordance that
+            // works even for a lone full-window pane, which has no tab bar.
+            response.context_menu(|ui| {
+                if ui.button("Split right").clicked() {
+                    self.split_request = Some((tile_id, SplitDir::Right));
+                    ui.close();
+                }
+                if ui.button("Split down").clicked() {
+                    self.split_request = Some((tile_id, SplitDir::Down));
+                    ui.close();
+                }
+                ui.separator();
+                if ui.button("Close").clicked() {
+                    self.close_request = Some(tile_id);
+                    ui.close();
+                }
+            });
         }
         // The pane body is for interacting with the terminal, not for dragging
         // the tile. Dragging happens via a tab handle, drawn by egui_tiles for
@@ -649,6 +738,32 @@ fn attach_pane(tree: &mut Tree<SessionId>, instance: SessionId) -> TileId {
         }
     }
     leaf
+}
+
+/// Split the pane at `at` into a two-child linear container, keeping `existing`
+/// and adding `new` beside or below it (FR-85). Returns the new pane's leaf.
+///
+/// The trick is to overwrite the tile *at the same id*: `at`'s parent (or the
+/// root) already points to `at`, so turning `at` into the split container needs
+/// no parent surgery. The existing session moves to a fresh leaf under the new
+/// container; its live terminal, keyed by session id, is untouched. egui_tiles
+/// draws the resizable divider and, on close, promotes the survivor (FR-87).
+fn split_tile(
+    tree: &mut Tree<SessionId>,
+    existing: SessionId,
+    new: SessionId,
+    at: TileId,
+    dir: SplitDir,
+) -> TileId {
+    let moved = tree.tiles.insert_pane(existing);
+    let new_leaf = tree.tiles.insert_pane(new);
+    let children = vec![moved, new_leaf];
+    let container = match dir {
+        SplitDir::Right => Container::new_horizontal(children),
+        SplitDir::Down => Container::new_vertical(children),
+    };
+    tree.tiles.insert(at, Tile::Container(container));
+    new_leaf
 }
 
 /// Collect the session ids of every pane leaf in `tile`'s subtree, walking
@@ -725,6 +840,47 @@ mod tests {
         let l2 = attach_pane(&mut tree, i2);
         assert_ne!(l1, l2);
         assert_eq!(tabs_root(&tree).children.len(), 2);
+    }
+
+    #[test]
+    fn splitting_a_bare_pane_makes_a_two_pane_row() {
+        let mut tree = empty_tree();
+        let a = SessionId::new();
+        let root = attach_pane(&mut tree, a); // a lone full-window pane
+        let c = SessionId::new();
+        let new_leaf = split_tile(&mut tree, a, c, root, SplitDir::Right);
+
+        // The same tile id is now a horizontal container of two panes.
+        let container = tree.tiles.get_container(root).unwrap();
+        assert_eq!(container.kind(), egui_tiles::ContainerKind::Horizontal);
+        let kids = container.children_vec();
+        assert_eq!(kids.len(), 2);
+        assert!(kids.contains(&new_leaf));
+
+        let mut all = Vec::new();
+        collect_session_ids(&tree.tiles, root, &mut all);
+        assert_eq!(all.len(), 2);
+        assert!(all.contains(&a) && all.contains(&c));
+    }
+
+    #[test]
+    fn a_split_does_not_leak_input_to_a_sibling_tab() {
+        // Root tab group [A, B]; split A downward into [A, C]. A broadcast rooted
+        // at the split reaches A and C, never the sibling tab B (FR-90 holds
+        // across a split).
+        let mut tree = empty_tree();
+        let (a, b, c) = (SessionId::new(), SessionId::new(), SessionId::new());
+        let la = attach_pane(&mut tree, a);
+        let _lb = attach_pane(&mut tree, b); // root is now Tabs[la, lb]
+        split_tile(&mut tree, a, c, la, SplitDir::Down); // la becomes the split
+
+        let mut got = Vec::new();
+        collect_session_ids(&tree.tiles, la, &mut got);
+        assert!(got.contains(&a) && got.contains(&c));
+        assert!(
+            !got.contains(&b),
+            "a split must not reach the sibling tab (FR-90)"
+        );
     }
 
     #[test]
