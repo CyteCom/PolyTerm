@@ -49,6 +49,9 @@ use tokio::runtime::Handle;
 
 use crate::palette::Theme;
 use crate::pane::{LivePane, encode_key};
+use crate::sessions::{
+    EditorOutcome, FolderNode, SessionEditor, build_folder_tree, matches_query, parse_folder,
+};
 
 /// Storage key for the persisted tile layout (FR-95).
 const LAYOUT_KEY: &str = "polyterm_layout";
@@ -103,8 +106,16 @@ pub trait SessionSpawner: Send + Sync {
 enum PanelAction {
     OpenLocalShell,
     OpenSaved(SessionId),
-    Refresh,
     SetRestore(bool),
+    /// Open the editor for a new session in this folder (FR-5).
+    NewSession(FolderPath),
+    /// Open the editor pre-filled from an existing session (FR-5).
+    EditSession(SessionId),
+    DuplicateSession(SessionId),
+    DeleteSession(SessionId),
+    MoveSession(SessionId, FolderPath),
+    NewFolder(FolderPath),
+    DeleteFolder(FolderPath),
 }
 
 /// Which way to split a tile: `Right` puts the new pane beside the current one
@@ -155,6 +166,15 @@ pub struct TerminalApp {
     /// The saved sessions shown in the panel, loaded once and on refresh so the
     /// panel does not hit SQLite every frame.
     sessions: Vec<SessionSpec>,
+    /// The folders shown in the tree, including empty ones (FR-1). Cached like
+    /// [`Self::sessions`].
+    folders: Vec<FolderPath>,
+    /// The session-tree filter text (FR-6).
+    search: String,
+    /// Draft name for the "New folder" field.
+    new_folder_name: String,
+    /// The open new/edit-session form, if any (FR-5).
+    editor: Option<SessionEditor>,
     /// Whether the session panel is shown. Forced on while nothing is open.
     show_panel: bool,
     /// Whether to restore the tile layout on startup (FR-4 opt-in). Persisted.
@@ -256,6 +276,10 @@ impl TerminalApp {
             .as_ref()
             .and_then(|s| s.list_sessions().ok())
             .unwrap_or_default();
+        let folders = store
+            .as_ref()
+            .and_then(|s| s.list_folders().ok())
+            .unwrap_or_default();
         let restore_enabled = storage
             .and_then(|s| eframe::get_value::<bool>(s, RESTORE_KEY))
             .unwrap_or(false);
@@ -270,6 +294,10 @@ impl TerminalApp {
             rt,
             store,
             sessions,
+            folders,
+            search: String::new(),
+            new_folder_name: String::new(),
+            editor: None,
             show_panel: true,
             restore_enabled,
             last_error: None,
@@ -410,17 +438,29 @@ impl TerminalApp {
         }
     }
 
-    /// Reload the saved-session list from the store.
-    fn reload_sessions(&mut self) {
+    /// Reload the saved sessions and folders from the store (FR-1).
+    fn reload(&mut self) {
         if let Some(store) = &self.store {
             match store.list_sessions() {
-                Ok(list) => {
-                    self.sessions = list;
-                    self.last_error = None;
-                }
+                Ok(list) => self.sessions = list,
                 Err(e) => self.last_error = Some(format!("Could not list sessions: {e}")),
             }
+            match store.list_folders() {
+                Ok(list) => self.folders = list,
+                Err(e) => self.last_error = Some(format!("Could not list folders: {e}")),
+            }
         }
+    }
+
+    /// Persist a session from the editor and refresh the tree (FR-5).
+    fn save_session(&mut self, spec: SessionSpec) {
+        if let Some(store) = &self.store
+            && let Err(e) = store.upsert_session(&spec)
+        {
+            self.last_error = Some(format!("Could not save {}: {e}", spec.name));
+            return;
+        }
+        self.reload();
     }
 
     fn apply_panel_action(&mut self, ctx: &egui::Context, action: PanelAction) {
@@ -429,9 +469,42 @@ impl TerminalApp {
                 self.open_in_new_tab(ctx, PaneSource::Adhoc(Box::new(local_shell_spec())))
             }
             PanelAction::OpenSaved(id) => self.open_in_new_tab(ctx, PaneSource::Saved(id)),
-            PanelAction::Refresh => self.reload_sessions(),
             PanelAction::SetRestore(enabled) => self.restore_enabled = enabled,
+            PanelAction::NewSession(folder) => self.editor = Some(SessionEditor::new_in(&folder)),
+            PanelAction::EditSession(id) => {
+                if let Some(spec) = self.sessions.iter().find(|s| s.id == id) {
+                    self.editor = Some(SessionEditor::edit(spec));
+                }
+            }
+            PanelAction::DuplicateSession(id) => {
+                self.store_op(|store| store.duplicate_session(id).map(|_| ()));
+            }
+            PanelAction::DeleteSession(id) => {
+                self.store_op(|store| store.delete_session(id));
+            }
+            PanelAction::MoveSession(id, folder) => {
+                self.store_op(move |store| store.move_session(id, &folder));
+            }
+            PanelAction::NewFolder(path) => {
+                self.store_op(move |store| store.create_folder(&path));
+            }
+            PanelAction::DeleteFolder(path) => {
+                self.store_op(move |store| store.delete_folder(&path));
+            }
         }
+    }
+
+    /// Run a fallible store mutation, record any error, and refresh (FR-5).
+    fn store_op<F>(&mut self, op: F)
+    where
+        F: FnOnce(&SessionStore) -> Result<(), polyterm_store::StoreError>,
+    {
+        if let Some(store) = &self.store
+            && let Err(e) = op(store)
+        {
+            self.last_error = Some(format!("Store error: {e}"));
+        }
+        self.reload();
     }
 
     /// The session id of the focused tile: the leaf itself, or the first pane
@@ -609,39 +682,70 @@ impl TerminalApp {
         }
     }
 
-    /// The left session panel: open a local shell, open a saved session, or
-    /// refresh the list (FR-1). Returns the actions its clicks asked for, so
-    /// the app can apply them without borrowing itself mutably mid-draw.
-    fn session_panel(&self, ui: &mut egui::Ui) -> Vec<PanelAction> {
+    /// The left session panel: the folder tree of saved sessions (FR-1), a
+    /// filter (FR-6), and the create/edit/organise affordances (FR-5). Returns
+    /// the actions its clicks asked for, so the app can apply them without
+    /// borrowing itself mutably mid-draw.
+    fn session_panel(&mut self, ui: &mut egui::Ui) -> Vec<PanelAction> {
         let mut actions = Vec::new();
         ui.add_space(4.0);
         ui.heading("Sessions");
-        ui.add_space(4.0);
-        if ui.button("\u{2795} Local shell").clicked() {
-            actions.push(PanelAction::OpenLocalShell);
-        }
-        ui.separator();
+        ui.horizontal(|ui| {
+            if ui.button("+ Session").clicked() {
+                actions.push(PanelAction::NewSession(FolderPath::root()));
+            }
+            if ui.button("+ Local shell").clicked() {
+                actions.push(PanelAction::OpenLocalShell);
+            }
+        });
 
-        if self.store.is_some() {
-            if self.sessions.is_empty() {
-                ui.weak("No saved sessions yet.");
-            } else {
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, true])
-                    .show(ui, |ui| {
-                        for spec in &self.sessions {
-                            if ui.button(&spec.name).clicked() {
-                                actions.push(PanelAction::OpenSaved(spec.id));
-                            }
-                        }
-                    });
-            }
-            ui.add_space(4.0);
-            if ui.small_button("Refresh").clicked() {
-                actions.push(PanelAction::Refresh);
-            }
-        } else {
+        if self.store.is_none() {
+            ui.separator();
             ui.weak("Session store unavailable.");
+        } else {
+            ui.horizontal(|ui| {
+                ui.label("Filter");
+                ui.text_edit_singleline(&mut self.search);
+                if !self.search.is_empty() && ui.small_button("clear").clicked() {
+                    self.search.clear();
+                }
+            });
+            ui.separator();
+
+            let query = self.search.trim().to_owned();
+            let folders = self.folders.clone();
+            egui::ScrollArea::vertical()
+                .auto_shrink([false, true])
+                .show(ui, |ui| {
+                    if query.is_empty() {
+                        let tree = build_folder_tree(&self.sessions, &folders);
+                        render_folder(ui, &tree, &FolderPath::root(), &folders, &mut actions);
+                        if self.sessions.is_empty() && folders.is_empty() {
+                            ui.weak("No saved sessions yet.");
+                        }
+                    } else {
+                        let mut any = false;
+                        for spec in self.sessions.iter().filter(|s| matches_query(s, &query)) {
+                            session_row(ui, spec.id, &spec.name, &folders, &mut actions);
+                            any = true;
+                        }
+                        if !any {
+                            ui.weak("No matches.");
+                        }
+                    }
+                });
+
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.new_folder_name);
+                if ui.button("New folder").clicked() {
+                    let path = parse_folder(&self.new_folder_name);
+                    if !path.is_root() {
+                        actions.push(PanelAction::NewFolder(path));
+                        self.new_folder_name.clear();
+                    }
+                }
+            });
         }
 
         if let Some(err) = &self.last_error {
@@ -834,6 +938,16 @@ impl eframe::App for TerminalApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::NONE)
             .show(ui, |ui| self.draw_content(ui, &ctx));
+
+        // The new/edit-session form floats above everything while open (FR-5).
+        // Taken out so the save path can mutate the app without aliasing it.
+        if let Some(mut editor) = self.editor.take() {
+            match editor.show(&ctx) {
+                EditorOutcome::Open => self.editor = Some(editor),
+                EditorOutcome::Cancel => {}
+                EditorOutcome::Save(spec) => self.save_session(*spec),
+            }
+        }
     }
 
     /// Persist the layout and the restore opt-in (FR-95). eframe calls this on
@@ -1043,6 +1157,88 @@ fn split_tile(
     };
     tree.tiles.insert(at, Tile::Container(container));
     new_leaf
+}
+
+/// Render one folder node and its subfolders recursively (FR-1). Sessions are
+/// clickable to open; both sessions and folders carry a context menu for the
+/// management operations (FR-5).
+fn render_folder(
+    ui: &mut egui::Ui,
+    node: &FolderNode,
+    path: &FolderPath,
+    folders: &[FolderPath],
+    actions: &mut Vec<PanelAction>,
+) {
+    for (seg, child) in &node.subfolders {
+        let mut child_path = path.clone();
+        child_path.push(seg.clone());
+        let header = egui::CollapsingHeader::new(seg)
+            .id_salt(child_path.segments().join("/"))
+            .default_open(true)
+            .show(ui, |ui| {
+                render_folder(ui, child, &child_path, folders, actions)
+            });
+        header.header_response.context_menu(|ui| {
+            if ui.button("New session here").clicked() {
+                actions.push(PanelAction::NewSession(child_path.clone()));
+                ui.close();
+            }
+            ui.separator();
+            if ui.button("Delete folder").clicked() {
+                actions.push(PanelAction::DeleteFolder(child_path.clone()));
+                ui.close();
+            }
+        });
+    }
+    for (id, name) in &node.sessions {
+        session_row(ui, *id, name, folders, actions);
+    }
+}
+
+/// One session row: click to open; right-click to edit, duplicate, move between
+/// folders, or delete (FR-5).
+fn session_row(
+    ui: &mut egui::Ui,
+    id: SessionId,
+    name: &str,
+    folders: &[FolderPath],
+    actions: &mut Vec<PanelAction>,
+) {
+    let response = ui.selectable_label(false, name);
+    if response.clicked() {
+        actions.push(PanelAction::OpenSaved(id));
+    }
+    response.context_menu(|ui| {
+        if ui.button("Open").clicked() {
+            actions.push(PanelAction::OpenSaved(id));
+            ui.close();
+        }
+        if ui.button("Edit\u{2026}").clicked() {
+            actions.push(PanelAction::EditSession(id));
+            ui.close();
+        }
+        if ui.button("Duplicate").clicked() {
+            actions.push(PanelAction::DuplicateSession(id));
+            ui.close();
+        }
+        ui.menu_button("Move to", |ui| {
+            if ui.button("(root)").clicked() {
+                actions.push(PanelAction::MoveSession(id, FolderPath::root()));
+                ui.close();
+            }
+            for folder in folders.iter().filter(|f| !f.is_root()) {
+                if ui.button(folder.segments().join("/")).clicked() {
+                    actions.push(PanelAction::MoveSession(id, folder.clone()));
+                    ui.close();
+                }
+            }
+        });
+        ui.separator();
+        if ui.button("Delete").clicked() {
+            actions.push(PanelAction::DeleteSession(id));
+            ui.close();
+        }
+    });
 }
 
 /// Collect the session ids of every pane leaf in `tile`'s subtree, walking

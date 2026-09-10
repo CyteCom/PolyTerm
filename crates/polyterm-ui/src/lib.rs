@@ -21,6 +21,7 @@ mod app;
 mod palette;
 mod pane;
 mod session_log;
+mod sessions;
 
 pub use app::{SessionSpawner, TerminalApp};
 pub use palette::Theme;
