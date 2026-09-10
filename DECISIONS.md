@@ -400,3 +400,44 @@ spawner reports it unsupported until M8 gives RDP its own pane type.
 returns a handle immediately and progress arrives as events). If a backend ever
 needs to do blocking work before it can hand back a handle, the spawner returns
 a future instead — a signature change, not a design change.
+
+---
+
+## ADR-16 · Accepted · `russh` needs a C crypto backend; use `ring`
+
+**Decision.** `polyterm-ssh` depends on `russh` with `default-features = false` and the
+`ring` crypto backend (plus `flate2` and `rsa`), not the default `aws-lc-rs`.
+
+**Context / correction to ADR-1.** ADR-1 chose `russh` in the belief that the Rust SSH
+stack was free of a C build dependency. That is not so: `russh` 0.63 has a hard
+`compile_error!` requiring either `ring` or `aws-lc-rs`, both of which are C/assembly
+crypto libraries — AES-GCM and the accelerated primitives are backend-only, and the crate
+will not build with neither. There is no pure-Rust build of `russh`, and mainstream Rust
+SSH has always leaned on `ring`. So the pure-Rust property ADR-1 assumed for SSH was never
+attainable with this crate; SSH costs one C build dependency whichever way we turn.
+
+**Why `ring` over `aws-lc-rs`.** Both are C/assembly. `ring` builds with just a C
+compiler — which both targets already have (MSVC on Windows per the toolchain note, `cc`
+on the Linux CI) — whereas `aws-lc-rs` additionally wants CMake and NASM on Windows. `ring`
+is the lighter, long-established choice and is enough for full modern-OpenSSH algorithm
+coverage (curve25519 / NIST ECDH, chacha20-poly1305, AES-GCM/CTR, ed25519/RSA/ECDSA).
+
+**Scope of the deviation.** This is a *build-time* dependency: `ring` is compiled and
+statically linked into the single binary. NFR-2's runtime property is intact — still one
+executable per platform, no runtime interpreter, no bundled daemon, no C service process.
+What changes is the build: a C compiler is now required to build the SSH crate, so
+CLAUDE.md §5's "prefer pure-Rust; C needs agreement" is exercised here, with agreement
+recorded. The rest of the workspace stays pure-Rust; only `polyterm-ssh` (and anything
+that links it — the binary) pulls `ring` in.
+
+**Rejected.**
+
+- **`aws-lc-rs`** (russh's default) — heavier build (CMake + NASM on Windows) for no
+  benefit we need. Reconsider only if a FIPS-validated backend becomes a requirement.
+- **Dropping SSH to stay pure-Rust** — SSH is a core feature (M5, FR-20..29); a
+  connection manager without it is not the product.
+
+**Revisit if.** A genuinely pure-Rust SSH client with adequate algorithm coverage appears,
+or `russh` gains a pure-Rust backend. Either would let us drop the C build dependency
+without touching anything above `polyterm-ssh`, which is why the `Transport` boundary and
+`SessionSpawner` (ADR-15) keep this contained.

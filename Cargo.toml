@@ -57,7 +57,12 @@ alacritty_terminal = "0.26"   # (unused until M2)
 # russh-keys is deliberately absent: it was folded into russh, last saw a
 # release in January 2025, and russh 0.63 depends on ssh-key/ssh-encoding
 # instead. Do not reintroduce it.
-russh        = "0.63"         # (unused until M5)
+#
+# `ring` crypto backend, not the default `aws-lc-rs` (ADR-16): russh has a hard
+# compile_error requiring one C/assembly backend, and `ring` is the lighter of
+# the two and builds with the C compiler both targets already have. `flate2`
+# (pure-Rust miniz_oxide) for SSH compression; `rsa` for RSA keys.
+russh        = { version = "0.63", default-features = false, features = ["ring", "flate2", "rsa"] }
 russh-sftp   = "3"            # (unused until M7; pairing with russh 0.63 is unverified)
 serialport   = { version = "4.10", default-features = false }  # no libudev: keep pure-Rust (see DECISIONS)
 portable-pty = "0.9"          # (unused until M2)
