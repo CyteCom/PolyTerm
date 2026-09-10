@@ -38,7 +38,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Instant;
 
-use egui::{Align2, Color32, Event, FontId, Key, Pos2, Vec2};
+use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Vec2};
 use egui_tiles::{Behavior, Container, Tile, TileId, Tiles, Tree, UiResponse};
 use polyterm_core::{
     BoxError, FolderPath, PtyConfig, SessionId, SessionKind, SessionSpec, TransportHandle,
@@ -112,6 +112,15 @@ enum PanelAction {
 #[derive(Debug, Clone, Copy)]
 enum SplitDir {
     Right,
+    Down,
+}
+
+/// A direction to move keyboard focus between tiles (FR-89).
+#[derive(Debug, Clone, Copy)]
+enum FocusDir {
+    Left,
+    Right,
+    Up,
     Down,
 }
 
@@ -455,6 +464,33 @@ impl TerminalApp {
         set
     }
 
+    /// Move keyboard focus to the nearest pane in `dir` (FR-89). Spatial, using
+    /// each pane's last laid-out rect; a no-op if there is no pane that way (or
+    /// nothing has been laid out yet).
+    fn focus_neighbor(&mut self, dir: FocusDir) {
+        let Some(focused) = self.focused else {
+            return;
+        };
+        let Some(from) = self.tree.tiles.rect(focused) else {
+            return;
+        };
+        let candidates: Vec<TileId> = self
+            .tree
+            .tiles
+            .iter()
+            .filter_map(|(id, tile)| {
+                (matches!(tile, Tile::Pane(_)) && *id != focused).then_some(*id)
+            })
+            .collect();
+        let panes: Vec<(TileId, Rect)> = candidates
+            .iter()
+            .filter_map(|&id| self.tree.tiles.rect(id).map(|r| (id, r)))
+            .collect();
+        if let Some(next) = pick_neighbor(&panes, from, dir) {
+            self.focused = Some(next);
+        }
+    }
+
     /// If focus no longer points at a live pane (its tab was closed), move it
     /// to the first active pane, or clear it when nothing is open.
     fn validate_focus(&mut self) {
@@ -522,6 +558,28 @@ impl TerminalApp {
                     if let Some(live) = self.live.get_mut(&focused) {
                         live.toggle_logging();
                     }
+                }
+                // Ctrl+Shift+Arrow moves focus between tiles (FR-89). Consumed
+                // here so the arrow never reaches the terminal.
+                Event::Key {
+                    key,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.ctrl
+                    && modifiers.shift
+                    && matches!(
+                        key,
+                        Key::ArrowLeft | Key::ArrowRight | Key::ArrowUp | Key::ArrowDown
+                    ) =>
+                {
+                    let dir = match key {
+                        Key::ArrowLeft => FocusDir::Left,
+                        Key::ArrowRight => FocusDir::Right,
+                        Key::ArrowUp => FocusDir::Up,
+                        _ => FocusDir::Down,
+                    };
+                    self.focus_neighbor(dir);
                 }
                 Event::Key {
                     key,
@@ -1004,6 +1062,66 @@ fn collect_session_ids(tiles: &Tiles<SessionId>, tile: TileId, out: &mut Vec<Ses
     }
 }
 
+/// Whether two 1-D ranges overlap.
+fn ranges_overlap(a0: f32, a1: f32, b0: f32, b1: f32) -> bool {
+    a0 < b1 && b0 < a1
+}
+
+/// Pick the pane to move focus to from rect `from` in direction `dir` (FR-89).
+/// Among panes on the correct side, prefer those whose cross-axis range
+/// overlaps `from` (so focus tends to stay in a row/column), then the nearest
+/// in the primary axis, then the nearest by cross-axis centre. `None` if there
+/// is no pane that way.
+fn pick_neighbor(panes: &[(TileId, Rect)], from: Rect, dir: FocusDir) -> Option<TileId> {
+    let fc = from.center();
+    // Best so far: (id, cross-axis overlaps, primary gap, cross-axis distance).
+    let mut best: Option<(TileId, bool, f32, f32)> = None;
+    for &(id, r) in panes {
+        let c = r.center();
+        let (eligible, gap, overlap, cross) = match dir {
+            FocusDir::Right => (
+                c.x > fc.x + 1.0,
+                (r.left() - from.right()).max(0.0),
+                ranges_overlap(r.top(), r.bottom(), from.top(), from.bottom()),
+                (c.y - fc.y).abs(),
+            ),
+            FocusDir::Left => (
+                c.x < fc.x - 1.0,
+                (from.left() - r.right()).max(0.0),
+                ranges_overlap(r.top(), r.bottom(), from.top(), from.bottom()),
+                (c.y - fc.y).abs(),
+            ),
+            FocusDir::Down => (
+                c.y > fc.y + 1.0,
+                (r.top() - from.bottom()).max(0.0),
+                ranges_overlap(r.left(), r.right(), from.left(), from.right()),
+                (c.x - fc.x).abs(),
+            ),
+            FocusDir::Up => (
+                c.y < fc.y - 1.0,
+                (from.top() - r.bottom()).max(0.0),
+                ranges_overlap(r.left(), r.right(), from.left(), from.right()),
+                (c.x - fc.x).abs(),
+            ),
+        };
+        if !eligible {
+            continue;
+        }
+        let better = match best {
+            None => true,
+            Some((_, best_overlap, best_gap, best_cross)) => match (overlap, best_overlap) {
+                (true, false) => true,
+                (false, true) => false,
+                _ => gap < best_gap - 0.5 || ((gap - best_gap).abs() <= 0.5 && cross < best_cross),
+            },
+        };
+        if better {
+            best = Some((id, overlap, gap, cross));
+        }
+    }
+    best.map(|(id, ..)| id)
+}
+
 /// Whether `target` lies in `root`'s subtree, checked by walking *down* from
 /// `root`. Used to decide which broadcast tile a focused leaf belongs to
 /// without ever consulting a parent pointer (§10.2).
@@ -1231,6 +1349,49 @@ mod tests {
         assert!(subtree_contains(&tiles, tabs, pa));
         assert!(!subtree_contains(&tiles, tabs, pc));
         assert!(subtree_contains(&tiles, root, pc));
+    }
+
+    #[test]
+    fn directional_focus_picks_the_adjacent_pane() {
+        // A 2x2 grid of 100x100 panes; ids come from a Tiles, rects are chosen.
+        let mut tiles: Tiles<SessionId> = Tiles::default();
+        let tl = tiles.insert_pane(SessionId::new());
+        let tr = tiles.insert_pane(SessionId::new());
+        let bl = tiles.insert_pane(SessionId::new());
+        let br = tiles.insert_pane(SessionId::new());
+        let cell = |x: f32, y: f32| Rect::from_min_size(egui::pos2(x, y), egui::vec2(100.0, 100.0));
+
+        // From the top-left pane.
+        let others = vec![
+            (tr, cell(100.0, 0.0)),
+            (bl, cell(0.0, 100.0)),
+            (br, cell(100.0, 100.0)),
+        ];
+        assert_eq!(
+            pick_neighbor(&others, cell(0.0, 0.0), FocusDir::Right),
+            Some(tr)
+        );
+        assert_eq!(
+            pick_neighbor(&others, cell(0.0, 0.0), FocusDir::Down),
+            Some(bl)
+        );
+        assert_eq!(pick_neighbor(&others, cell(0.0, 0.0), FocusDir::Left), None);
+        assert_eq!(pick_neighbor(&others, cell(0.0, 0.0), FocusDir::Up), None);
+
+        // From the bottom-right pane, moving back up and left.
+        let others = vec![
+            (tl, cell(0.0, 0.0)),
+            (tr, cell(100.0, 0.0)),
+            (bl, cell(0.0, 100.0)),
+        ];
+        assert_eq!(
+            pick_neighbor(&others, cell(100.0, 100.0), FocusDir::Left),
+            Some(bl)
+        );
+        assert_eq!(
+            pick_neighbor(&others, cell(100.0, 100.0), FocusDir::Up),
+            Some(tr)
+        );
     }
 
     #[test]
