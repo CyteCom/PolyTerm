@@ -16,7 +16,9 @@ use std::time::Instant;
 use bytes::Bytes;
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Sense, Vec2};
 use polyterm_core::{ControlMsg, TransportEvent, TransportHandle};
-use polyterm_term::{CursorShape, GridSize, Snapshot, TermEvent, Terminal};
+use polyterm_term::{
+    CursorShape, GridSize, MouseEncoding, MouseProtocol, MouseReport, Snapshot, TermEvent, Terminal,
+};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
@@ -76,6 +78,12 @@ pub struct TerminalApp {
     last_size: GridSize,
     /// The active mouse selection, if any (FR-14).
     selection: Option<Selection>,
+    /// Mouse buttons currently held, for drag reporting (bit 0 left, 1 middle,
+    /// 2 right). See [`Self::handle_mouse_reporting`] (FR-13).
+    buttons_down: u8,
+    /// The last cell a motion event was reported for, to send one report per
+    /// cell crossed rather than per pixel.
+    last_report_cell: Option<Cell>,
     title: String,
     /// The title currently applied to the window, so it is set only on change.
     applied_title: String,
@@ -191,6 +199,8 @@ impl TerminalApp {
             events: ui_events_rx,
             last_size: initial,
             selection: None,
+            buttons_down: 0,
+            last_report_cell: None,
             title: "polyterm".to_owned(),
             applied_title: String::new(),
             disconnected: false,
@@ -301,17 +311,10 @@ impl TerminalApp {
         cell_w: f32,
         cell_h: f32,
     ) {
-        let to_cell = |pos: Pos2| -> Cell {
-            let col = ((pos.x - origin.x) / cell_w).floor();
-            let row = ((pos.y - origin.y) / cell_h).floor();
-            let col = col.clamp(0.0, snapshot.size.cols.saturating_sub(1) as f32) as u16;
-            let row = row.clamp(0.0, snapshot.size.rows.saturating_sub(1) as f32) as u16;
-            (row, col)
-        };
-
+        let size = snapshot.size;
         if response.drag_started() {
             if let Some(pos) = response.interact_pointer_pos() {
-                let cell = to_cell(pos);
+                let cell = pos_to_cell(pos, origin, cell_w, cell_h, size);
                 self.selection = Some(Selection {
                     anchor: cell,
                     head: cell,
@@ -321,7 +324,7 @@ impl TerminalApp {
             && let Some(pos) = response.interact_pointer_pos()
             && let Some(sel) = self.selection.as_mut()
         {
-            sel.head = to_cell(pos);
+            sel.head = pos_to_cell(pos, origin, cell_w, cell_h, size);
         } else if response.drag_stopped()
             && let Some(text) = self.selection.and_then(|s| selection_text(s, snapshot))
         {
@@ -331,6 +334,95 @@ impl TerminalApp {
         // A plain click (no drag) clears the selection.
         if response.clicked() {
             self.selection = None;
+        }
+    }
+
+    /// Encode this frame's mouse events for the application and send them to the
+    /// far end (FR-13). Which events are sent depends on the reporting protocol;
+    /// how they are encoded depends on `report.encoding`.
+    fn handle_mouse_reporting(
+        &mut self,
+        ctx: &egui::Context,
+        report: MouseReport,
+        snapshot: &Snapshot,
+        origin: Pos2,
+        cell_w: f32,
+        cell_h: f32,
+    ) {
+        let size = snapshot.size;
+        let hover = ctx.input(|i| i.pointer.hover_pos());
+        let events = ctx.input(|i| i.events.clone());
+        let mut out = Vec::new();
+
+        for event in events {
+            match event {
+                egui::Event::PointerButton {
+                    pos,
+                    button,
+                    pressed,
+                    modifiers,
+                } => {
+                    let Some(base) = button_base(button) else {
+                        continue;
+                    };
+                    let cell = pos_to_cell(pos, origin, cell_w, cell_h, size);
+                    let mods = mouse_mods(modifiers);
+                    let bit = 1u8 << base;
+                    if pressed {
+                        self.buttons_down |= bit;
+                    } else {
+                        self.buttons_down &= !bit;
+                    }
+                    if let Some(seq) = encode_mouse(report, base, false, !pressed, mods, cell) {
+                        out.extend_from_slice(&seq);
+                    }
+                }
+                egui::Event::PointerMoved(pos) => {
+                    let want = match report.protocol {
+                        MouseProtocol::ButtonDrag => self.buttons_down != 0,
+                        MouseProtocol::AnyMotion => true,
+                        MouseProtocol::Click | MouseProtocol::Off => false,
+                    };
+                    if !want {
+                        continue;
+                    }
+                    let cell = pos_to_cell(pos, origin, cell_w, cell_h, size);
+                    // One report per cell entered, not per pixel.
+                    if self.last_report_cell == Some(cell) {
+                        continue;
+                    }
+                    self.last_report_cell = Some(cell);
+                    // The reported button is the lowest one held, or 3 ("no
+                    // button") for buttonless motion in any-event mode.
+                    let base = held_button(self.buttons_down);
+                    if let Some(seq) = encode_mouse(report, base, true, false, 0, cell) {
+                        out.extend_from_slice(&seq);
+                    }
+                }
+                egui::Event::MouseWheel {
+                    delta, modifiers, ..
+                } => {
+                    // Wheel is reported as button 64 (up) / 65 (down), press
+                    // only. One report per event; the sign follows our
+                    // scrollback convention (positive delta is up/older).
+                    if delta.y.abs() < 0.5 {
+                        continue;
+                    }
+                    let base = if delta.y > 0.0 { 64 } else { 65 };
+                    let mods = mouse_mods(modifiers);
+                    let cell = hover
+                        .map(|p| pos_to_cell(p, origin, cell_w, cell_h, size))
+                        .unwrap_or((0, 0));
+                    if let Some(seq) = encode_mouse(report, base, false, false, mods, cell) {
+                        out.extend_from_slice(&seq);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        if !out.is_empty() {
+            let _ = self.input.try_send(Bytes::from(out));
         }
     }
 
@@ -373,7 +465,17 @@ impl eframe::App for TerminalApp {
             return;
         }
 
-        self.pump_scroll(&ctx, cell_h);
+        // Is the application driving the mouse (FR-13)? Holding Shift always
+        // bypasses reporting so the user can select locally, as every terminal
+        // does. When the app owns the mouse, or is on the alternate screen, the
+        // wheel belongs to it, not to our scrollback.
+        let report = self.terminal.mouse_report();
+        let alt_screen = self.terminal.alt_screen();
+        let shift = ctx.input(|i| i.modifiers.shift);
+        let reporting = report.is_on() && !shift;
+        if !reporting && !alt_screen {
+            self.pump_scroll(&ctx, cell_h);
+        }
 
         let avail = ui.available_rect_before_wrap();
         ui.painter().rect_filled(avail, 0.0, self.theme.background);
@@ -396,9 +498,16 @@ impl eframe::App for TerminalApp {
 
         let snapshot = self.terminal.snapshot();
 
-        // Mouse selection and copy-on-release (FR-14), then keyboard/clipboard.
         let response = ui.allocate_rect(avail, Sense::click_and_drag());
-        self.handle_pointer(&ctx, &response, &snapshot, avail.min, cell_w, cell_h);
+        if reporting {
+            // The application owns the mouse: report events to it (FR-13) and
+            // drop any local selection.
+            self.selection = None;
+            self.handle_mouse_reporting(&ctx, report, &snapshot, avail.min, cell_w, cell_h);
+        } else {
+            // Local selection and copy-on-release (FR-14).
+            self.handle_pointer(&ctx, &response, &snapshot, avail.min, cell_w, cell_h);
+        }
         self.handle_keyboard(&ctx, &snapshot);
 
         let paint_start = self.perf.is_some().then(Instant::now);
@@ -583,6 +692,95 @@ fn selection_text(selection: Selection, snapshot: &Snapshot) -> Option<String> {
     }
 }
 
+/// Map a pixel position to a grid cell, clamped to the grid.
+fn pos_to_cell(pos: Pos2, origin: Pos2, cell_w: f32, cell_h: f32, size: GridSize) -> Cell {
+    let col = ((pos.x - origin.x) / cell_w)
+        .floor()
+        .clamp(0.0, size.cols.saturating_sub(1) as f32) as u16;
+    let row = ((pos.y - origin.y) / cell_h)
+        .floor()
+        .clamp(0.0, size.rows.saturating_sub(1) as f32) as u16;
+    (row, col)
+}
+
+/// The mouse-protocol base button code for an egui button: left 0, middle 1,
+/// right 2. `None` for buttons the protocol has no code for.
+fn button_base(button: egui::PointerButton) -> Option<u8> {
+    match button {
+        egui::PointerButton::Primary => Some(0),
+        egui::PointerButton::Middle => Some(1),
+        egui::PointerButton::Secondary => Some(2),
+        _ => None,
+    }
+}
+
+/// The lowest button currently held, or 3 ("no button") when none are — the
+/// code motion events carry.
+fn held_button(buttons_down: u8) -> u8 {
+    if buttons_down & 0b001 != 0 {
+        0
+    } else if buttons_down & 0b010 != 0 {
+        1
+    } else if buttons_down & 0b100 != 0 {
+        2
+    } else {
+        3
+    }
+}
+
+/// Modifier bits in the mouse-report button byte: shift 4, alt 8, ctrl 16.
+fn mouse_mods(m: egui::Modifiers) -> u8 {
+    let mut bits = 0;
+    if m.shift {
+        bits |= 4;
+    }
+    if m.alt {
+        bits |= 8;
+    }
+    if m.ctrl || m.command {
+        bits |= 16;
+    }
+    bits
+}
+
+/// Encode one mouse event. `base` is the button/wheel code (0/1/2, or 64/65 for
+/// wheel, or 3 for buttonless motion); `motion` adds the drag bit; `release`
+/// selects the release form. `None` when a legacy-encoded coordinate exceeds
+/// the 223-column limit that only SGR can carry.
+fn encode_mouse(
+    report: MouseReport,
+    base: u8,
+    motion: bool,
+    release: bool,
+    mods: u8,
+    cell: Cell,
+) -> Option<Vec<u8>> {
+    let (row, col) = cell;
+    let x = col as u32 + 1;
+    let y = row as u32 + 1;
+    match report.encoding {
+        MouseEncoding::Sgr => {
+            let mut cb = base | mods;
+            if motion {
+                cb |= 32;
+            }
+            let terminator = if release { 'm' } else { 'M' };
+            Some(format!("\x1b[<{cb};{x};{y}{terminator}").into_bytes())
+        }
+        MouseEncoding::Normal => {
+            if x > 223 || y > 223 {
+                return None;
+            }
+            // Legacy release does not name the button — it is always code 3.
+            let mut cb = if release { 3 } else { base } | mods;
+            if motion {
+                cb |= 32;
+            }
+            Some(vec![0x1b, b'[', b'M', 32 + cb, 32 + x as u8, 32 + y as u8])
+        }
+    }
+}
+
 /// Encode a non-text key press into the bytes a terminal expects. Returns
 /// `None` for keys whose character already arrives as [`Event::Text`].
 fn encode_key(key: Key, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
@@ -627,6 +825,7 @@ fn encode_key(key: Key, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
 }
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
     use polyterm_term::{Attrs, Cell as TermCell, Color, Cursor, Damage, Line};
@@ -706,6 +905,86 @@ mod tests {
         assert!(s.contains((2, 0))); // before end on the last row
         assert!(!s.contains((1, 2))); // before start
         assert!(!s.contains((2, 2))); // after end
+    }
+
+    fn sgr() -> MouseReport {
+        MouseReport {
+            protocol: MouseProtocol::ButtonDrag,
+            encoding: MouseEncoding::Sgr,
+        }
+    }
+
+    fn legacy() -> MouseReport {
+        MouseReport {
+            protocol: MouseProtocol::Click,
+            encoding: MouseEncoding::Normal,
+        }
+    }
+
+    #[test]
+    fn sgr_press_and_release_are_1_based_with_m_and_lowercase_m() {
+        // Left press at row 0, col 0 → button 0, 1;1, 'M'.
+        assert_eq!(
+            encode_mouse(sgr(), 0, false, false, 0, (0, 0)).unwrap(),
+            b"\x1b[<0;1;1M"
+        );
+        // Left release → same coords, 'm'.
+        assert_eq!(
+            encode_mouse(sgr(), 0, false, true, 0, (0, 0)).unwrap(),
+            b"\x1b[<0;1;1m"
+        );
+        // Right press at row 4, col 9 → button 2, x=10, y=5.
+        assert_eq!(
+            encode_mouse(sgr(), 2, false, false, 0, (4, 9)).unwrap(),
+            b"\x1b[<2;10;5M"
+        );
+    }
+
+    #[test]
+    fn sgr_motion_sets_the_drag_bit() {
+        // Left held, dragging → 0 | 32 = 32.
+        assert_eq!(
+            encode_mouse(sgr(), 0, true, false, 0, (2, 3)).unwrap(),
+            b"\x1b[<32;4;3M"
+        );
+    }
+
+    #[test]
+    fn sgr_wheel_and_modifiers() {
+        // Wheel up = 64; Ctrl adds 16 → 80.
+        assert_eq!(
+            encode_mouse(sgr(), 64, false, false, 16, (0, 0)).unwrap(),
+            b"\x1b[<80;1;1M"
+        );
+    }
+
+    #[test]
+    fn legacy_encoding_offsets_by_32_and_release_is_button_3() {
+        // Left press at (0,0): ESC [ M, cb=0+32, x=1+32, y=1+32.
+        assert_eq!(
+            encode_mouse(legacy(), 0, false, false, 0, (0, 0)).unwrap(),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        // Release → button code 3 regardless of which button.
+        assert_eq!(
+            encode_mouse(legacy(), 0, false, true, 0, (0, 0)).unwrap(),
+            vec![0x1b, b'[', b'M', 32 + 3, 33, 33]
+        );
+    }
+
+    #[test]
+    fn legacy_cannot_encode_beyond_223_columns() {
+        assert_eq!(encode_mouse(legacy(), 0, false, false, 0, (0, 250)), None);
+        // SGR has no such limit.
+        assert!(encode_mouse(sgr(), 0, false, false, 0, (0, 250)).is_some());
+    }
+
+    #[test]
+    fn held_button_is_lowest_or_none() {
+        assert_eq!(held_button(0b000), 3);
+        assert_eq!(held_button(0b001), 0);
+        assert_eq!(held_button(0b100), 2);
+        assert_eq!(held_button(0b110), 1); // middle + right → middle (lowest)
     }
 
     #[test]

@@ -11,6 +11,8 @@
 
 mod logging;
 
+use std::path::PathBuf;
+
 use anyhow::Context as _;
 use polyterm_core::{PtyConfig, Transport as _};
 use polyterm_pty::PtyTransport;
@@ -27,9 +29,15 @@ fn main() -> anyhow::Result<()> {
         .context("failed to build the tokio runtime")?;
 
     // Open a local shell. Construction is synchronous; the session's tasks run
-    // on the runtime.
+    // on the runtime. `POLYTERM_SHELL` overrides the default shell — a first
+    // slice of FR-56, and the way to get a Unix shell (e.g. `wsl.exe`) on
+    // Windows for now.
+    let mut cfg = PtyConfig::default();
+    if let Some(shell) = std::env::var_os("POLYTERM_SHELL") {
+        cfg.shell = Some(PathBuf::from(shell));
+    }
     let handle = PtyTransport
-        .spawn(runtime.handle(), PtyConfig::default())
+        .spawn(runtime.handle(), cfg)
         .context("failed to start local shell")?;
 
     info!("launching terminal window");

@@ -13,7 +13,7 @@ use alacritty_terminal::event::{Event, EventListener};
 use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::index::{Column, Line as TermLine};
 use alacritty_terminal::term::cell::{Cell as TermCell, Flags};
-use alacritty_terminal::term::{Config, Term, TermDamage};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     Color as VColor, CursorShape as VCursorShape, NamedColor, Processor,
 };
@@ -93,6 +93,43 @@ impl Dimensions for SizeInfo {
     }
 }
 
+/// Which mouse events the application has asked to receive (FR-13). Set by the
+/// application through DEC private modes; the UI reads this to decide whether a
+/// mouse event is reported to the far end or handled locally (selection).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseProtocol {
+    /// No reporting; the mouse is the UI's (selection, scrollback).
+    Off,
+    /// `?1000`: button press and release.
+    Click,
+    /// `?1002`: press, release, and motion while a button is held (drag).
+    ButtonDrag,
+    /// `?1003`: press, release, and all motion.
+    AnyMotion,
+}
+
+/// How mouse events are encoded on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEncoding {
+    /// Legacy `ESC [ M` byte encoding. Coordinates above 223 cannot be sent.
+    Normal,
+    /// `?1006` SGR encoding: `ESC [ < b ; x ; y M|m`. No coordinate limit.
+    Sgr,
+}
+
+/// The application's current mouse-reporting request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MouseReport {
+    pub protocol: MouseProtocol,
+    pub encoding: MouseEncoding,
+}
+
+impl MouseReport {
+    pub fn is_on(&self) -> bool {
+        self.protocol != MouseProtocol::Off
+    }
+}
+
 /// A terminal: a VT state machine over a byte stream. No I/O.
 pub struct Terminal {
     term: Term<EventProxy>,
@@ -147,6 +184,33 @@ impl Terminal {
 
     pub fn size(&self) -> GridSize {
         self.size
+    }
+
+    /// What mouse reporting the application currently wants (FR-13).
+    pub fn mouse_report(&self) -> MouseReport {
+        let mode = self.term.mode();
+        let protocol = if mode.contains(TermMode::MOUSE_MOTION) {
+            MouseProtocol::AnyMotion
+        } else if mode.contains(TermMode::MOUSE_DRAG) {
+            MouseProtocol::ButtonDrag
+        } else if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            MouseProtocol::Click
+        } else {
+            MouseProtocol::Off
+        };
+        let encoding = if mode.contains(TermMode::SGR_MOUSE) {
+            MouseEncoding::Sgr
+        } else {
+            MouseEncoding::Normal
+        };
+        MouseReport { protocol, encoding }
+    }
+
+    /// Whether the application has switched to the alternate screen (the
+    /// full-screen buffer used by `vim`, `htop`, `tmux`). When it has, the
+    /// mouse wheel should move within the app, not scroll our scrollback.
+    pub fn alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
     /// Scroll `lines` toward older scrollback (FR-12).
@@ -497,6 +561,37 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn mouse_report_reflects_the_application_modes() {
+        let mut t = term(80, 24);
+        assert_eq!(t.mouse_report().protocol, MouseProtocol::Off);
+
+        // htop/tmux enable button-event tracking with SGR encoding.
+        t.feed(b"\x1b[?1002h\x1b[?1006h");
+        let report = t.mouse_report();
+        assert_eq!(report.protocol, MouseProtocol::ButtonDrag);
+        assert_eq!(report.encoding, MouseEncoding::Sgr);
+        assert!(report.is_on());
+
+        // Any-motion tracking takes precedence when also set.
+        t.feed(b"\x1b[?1003h");
+        assert_eq!(t.mouse_report().protocol, MouseProtocol::AnyMotion);
+
+        // Disabling returns to Off.
+        t.feed(b"\x1b[?1002l\x1b[?1003l\x1b[?1000l");
+        assert_eq!(t.mouse_report().protocol, MouseProtocol::Off);
+    }
+
+    #[test]
+    fn alt_screen_is_reported() {
+        let mut t = term(80, 24);
+        assert!(!t.alt_screen());
+        t.feed(b"\x1b[?1049h"); // enter alternate screen
+        assert!(t.alt_screen());
+        t.feed(b"\x1b[?1049l"); // leave
+        assert!(!t.alt_screen());
     }
 
     #[test]

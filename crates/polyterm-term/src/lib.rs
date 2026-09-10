@@ -28,4 +28,4 @@ mod terminal;
 pub use snapshot::{
     Attrs, Cell, Color, Cursor, CursorShape, Damage, GridSize, Line, LineDamage, Snapshot,
 };
-pub use terminal::{TermEvent, Terminal};
+pub use terminal::{MouseEncoding, MouseProtocol, MouseReport, TermEvent, Terminal};
