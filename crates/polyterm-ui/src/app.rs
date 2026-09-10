@@ -23,6 +23,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::palette::Theme;
+use crate::session_log::{SessionLog, default_log_path};
 
 /// A cell position in viewport coordinates: `(row, col)`, row-major so that
 /// tuple ordering is reading order.
@@ -64,6 +65,8 @@ pub struct TerminalApp {
     terminal: Terminal,
     theme: Theme,
     font_size: f32,
+    /// The running session log, if any (FR-50). `Some` while logging.
+    log: Option<SessionLog>,
 
     /// Keystrokes and pastes toward the far end.
     input: mpsc::Sender<Bytes>,
@@ -193,6 +196,7 @@ impl TerminalApp {
             terminal: Terminal::new(initial, SCROLLBACK),
             theme: Theme::default(),
             font_size: 15.0,
+            log: None,
             input,
             control,
             output: ui_output_rx,
@@ -229,6 +233,11 @@ impl TerminalApp {
         while let Ok(chunk) = self.output.try_recv() {
             if let Some(perf) = self.perf.as_mut() {
                 perf.bytes += chunk.len();
+            }
+            // Session logging taps the raw output here, above the terminal, so
+            // it captures exactly what the far end sent (FR-50).
+            if let Some(log) = &self.log {
+                log.write(&chunk);
             }
             self.terminal.feed(&chunk);
             got_output = true;
@@ -278,6 +287,16 @@ impl TerminalApp {
                         }
                         None => out.push(0x03),
                     }
+                }
+                // Ctrl+Shift+L toggles session logging (FR-50). Intercepted
+                // before key encoding so it never reaches the far end.
+                Event::Key {
+                    key: Key::L,
+                    pressed: true,
+                    modifiers,
+                    ..
+                } if modifiers.ctrl && modifiers.shift => {
+                    self.toggle_logging();
                 }
                 Event::Key {
                     key,
@@ -516,11 +535,55 @@ impl eframe::App for TerminalApp {
             perf.record_paint(start.elapsed().as_secs_f32() * 1000.0);
         }
 
+        self.log_indicator(ui, avail, cell_h);
         self.perf_overlay(ui, avail, cell_h);
     }
 }
 
 impl TerminalApp {
+    /// Start or stop session logging (FR-50). With no file dialog yet, logging
+    /// goes to an auto-named file; the on-screen indicator shows where.
+    fn toggle_logging(&mut self) {
+        if self.log.is_some() {
+            self.log = None; // Drop flushes and closes the file.
+            return;
+        }
+        let path = default_log_path();
+        match SessionLog::start(path) {
+            Ok(log) => {
+                tracing::info!(path = %log.path().display(), "session logging started");
+                self.log = Some(log);
+            }
+            Err(e) => tracing::warn!(error = %e, "could not start session log"),
+        }
+    }
+
+    /// Show a recording indicator with the log file name while logging.
+    fn log_indicator(&self, ui: &egui::Ui, avail: Rect, cell_h: f32) {
+        let Some(log) = &self.log else {
+            return;
+        };
+        let name = log
+            .path()
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let text = format!("\u{25cf} LOG  {name}");
+        let font = FontId::monospace((cell_h * 0.8).max(10.0));
+        let painter = ui.painter();
+        let galley = painter.layout_no_wrap(text, font, Color32::WHITE);
+        let pos = Pos2::new(avail.left() + 8.0, avail.bottom() - 6.0);
+        let rect = Align2::LEFT_BOTTOM
+            .anchor_size(pos, galley.size())
+            .expand(3.0);
+        painter.rect_filled(rect, 2.0, Color32::from_black_alpha(190));
+        painter.galley(
+            rect.min + Vec2::new(3.0, 3.0),
+            galley,
+            Color32::from_rgb(0xff, 0x66, 0x66),
+        );
+    }
+
     /// Draw the FPS overlay and drive continuous repaint while measuring.
     fn perf_overlay(&mut self, ui: &egui::Ui, avail: Rect, cell_h: f32) {
         let Some(perf) = self.perf.as_mut() else {

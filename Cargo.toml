@@ -78,6 +78,9 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # --- misc --------------------------------------------------------------------
 uuid         = { version = "1", features = ["v4", "serde"] }
 parking_lot  = "0.12"         # (unused until M2)
+# Human-readable, multithread-safe local timestamps for session logging
+# (FR-50). Pure Rust; its non-dev deps carry no C dependency.
+jiff         = "0.2"
 # Scrubs Secret<T> from memory on drop. Pure Rust, no mandatory dependencies
 # of its own; see the consequence recorded under ADR-8.
 zeroize      = "1.9"

@@ -13,6 +13,7 @@
 
 mod app;
 mod palette;
+mod session_log;
 
 pub use app::TerminalApp;
 pub use palette::Theme;
