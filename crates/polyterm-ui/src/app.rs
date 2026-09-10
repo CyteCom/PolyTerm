@@ -223,6 +223,13 @@ impl eframe::App for TerminalApp {
         if size != self.last_size {
             self.terminal.resize(size);
             let _ = self.control.try_send(ControlMsg::Resize { cols, rows });
+            // Reflowing old content into the new grid leaves stale cells that
+            // the far end's differential repaint does not overwrite (visible as
+            // strays in the edge columns). Discard the grid on every resize and
+            // let the far end (ConPTY / the remote) repaint the new-size screen;
+            // it does so within a frame or two. The brief blank during a drag is
+            // the same behaviour most terminals show while resizing.
+            self.terminal.clear_screen();
             self.last_size = size;
         }
 
@@ -288,18 +295,20 @@ impl TerminalApp {
             match cursor.shape {
                 CursorShape::Block | CursorShape::Hidden => {
                     painter.rect_filled(rect, 0.0, self.theme.cursor);
-                    if let Some(line) = snapshot.lines.get(cursor.line as usize) {
-                        if let Some(cell) = line.cells.get(cursor.col as usize) {
-                            if cell.c != ' ' && cell.c != '\0' {
-                                painter.text(
-                                    Pos2::new(x, y),
-                                    Align2::LEFT_TOP,
-                                    cell.c,
-                                    font.clone(),
-                                    self.theme.background,
-                                );
-                            }
-                        }
+                    // Redraw the glyph under the block in the background colour
+                    // (inverse video), so the character stays legible.
+                    if let Some(line) = snapshot.lines.get(cursor.line as usize)
+                        && let Some(cell) = line.cells.get(cursor.col as usize)
+                        && cell.c != ' '
+                        && cell.c != '\0'
+                    {
+                        painter.text(
+                            Pos2::new(x, y),
+                            Align2::LEFT_TOP,
+                            cell.c,
+                            font.clone(),
+                            self.theme.background,
+                        );
                     }
                 }
                 CursorShape::Underline => {

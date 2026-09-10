@@ -1,4 +1,4 @@
-msrv = "1.85"
+msrv = "1.95"
 
 # CLAUDE.md 5: nothing may block the thread eframe owns. This catches the most
 # common way that rule gets broken by accident. Blocking calls belong on the

@@ -83,13 +83,13 @@ jobs:
 
   # rust-version in Cargo.toml is a claim; this is what makes it true. The
   # resolver is MSRV-aware, so a failure here means a dependency has no
-  # version that supports 1.85 and the declared MSRV must be raised honestly.
+  # version that supports the floor, the declared MSRV must be raised honestly.
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.95)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.95
       - uses: Swatinem/rust-cache@v2
       - name: linux build deps
         run: |

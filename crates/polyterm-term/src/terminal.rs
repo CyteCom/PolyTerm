@@ -165,6 +165,16 @@ impl Terminal {
         self.term.scroll_display(Scroll::Bottom);
     }
 
+    /// Erase the visible screen and home the cursor; scrollback is preserved.
+    ///
+    /// This is the same effect as the application sending `ESC[2J` — used to
+    /// discard stale grid content across a resize so the far end's repaint
+    /// starts from a clean screen, rather than leaving reflowed leftovers in
+    /// cells the repaint does not touch.
+    pub fn clear_screen(&mut self) {
+        self.feed(b"\x1b[H\x1b[2J");
+    }
+
     /// Drain the out-of-band events produced since the last call. Forward any
     /// [`TermEvent::PtyWrite`] to the transport.
     pub fn drain_events(&mut self) -> Vec<TermEvent> {
