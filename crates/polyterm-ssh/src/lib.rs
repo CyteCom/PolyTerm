@@ -16,13 +16,14 @@
 //! What is here: password, public-key (including encrypted keys, via a
 //! passphrase prompt), keyboard-interactive, and agent authentication — the
 //! agent being the Unix socket on Linux and the OpenSSH named pipe or Pageant
-//! on Windows (FR-22); and jump-host chaining, each hop verified and
-//! authenticated in its own right, tunnelled through the previous (FR-28).
-//! Automatic reconnect (FR-29) is the remaining follow-up.
+//! on Windows (FR-22); jump-host chaining, each hop verified and authenticated
+//! in its own right, tunnelled through the previous (FR-28); and keepalive with
+//! automatic, backing-off reconnect of a dropped session (FR-29).
 
 #![forbid(unsafe_code)]
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use bytes::Bytes;
 use polyterm_core::{
@@ -41,6 +42,11 @@ use tokio::sync::{mpsc, oneshot};
 /// the moment the pane is laid out, so this only governs the first instant.
 const INITIAL_COLS: u32 = 80;
 const INITIAL_ROWS: u32 = 24;
+
+/// Reconnect backoff (FR-29): first wait, and the cap it doubles up to. Fixed
+/// for now; exposing it in the session config is a settings-UI follow-up.
+const INITIAL_BACKOFF: Duration = Duration::from_secs(1);
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
 
 /// An SSH shell backend.
 ///
@@ -64,7 +70,11 @@ impl Transport for SshTransport {
     }
 }
 
-/// Drive one SSH session from connect to disconnect.
+/// Drive one SSH session, reconnecting automatically if an established one
+/// drops (FR-29). A session that never connected — a bad host, a refused
+/// password — is not retried; only a link that was up and went down is. The
+/// user ends it with [`ControlMsg::Disconnect`], and can cut a backoff short
+/// with [`ControlMsg::Reconnect`].
 async fn run(cfg: SshConfig, backend: TransportBackendEnd) {
     let TransportBackendEnd {
         output,
@@ -73,40 +83,99 @@ async fn run(cfg: SshConfig, backend: TransportBackendEnd) {
         events,
     } = backend;
 
-    let _ = events.send(TransportEvent::Connecting).await;
-
     let config = Arc::new(client::Config {
         keepalive_interval: cfg.keepalive,
         ..Default::default()
     });
 
-    // Connect through any jump hosts to the target, authenticating every hop
-    // (FR-28). `establish` reports its own failures, so `None` means stop. The
-    // whole chain is kept alive: each session tunnels through the one before it,
-    // so dropping an earlier hop would collapse the tunnel to the target.
-    let chain = match establish(&cfg, config, &events).await {
-        Some(chain) => chain,
-        None => return,
-    };
-    let _ = events.send(TransportEvent::Authenticated).await;
+    let mut backoff = INITIAL_BACKOFF;
+    let mut connected_before = false;
+    // Remembered across reconnects so a new shell opens at the current size.
+    let mut size = (INITIAL_COLS, INITIAL_ROWS);
 
-    let reason = {
-        let Some(target) = chain.last() else {
-            return fail(&events, "no session was established".to_owned()).await;
-        };
-        let channel = match open_shell(target).await {
-            Ok(channel) => channel,
-            Err(e) => return fail(&events, format!("could not open shell: {e}")).await,
-        };
-        let _ = events.send(TransportEvent::Connected).await;
+    loop {
+        let _ = events.send(TransportEvent::Connecting).await;
+        match establish(&cfg, config.clone(), &events).await {
+            Some(chain) => {
+                connected_before = true;
+                backoff = INITIAL_BACKOFF;
+                let _ = events.send(TransportEvent::Authenticated).await;
+                let reason =
+                    run_connected(chain, &mut input, &mut control, &output, &events, &mut size)
+                        .await;
+                let user_ended = reason == DisconnectReason::Local;
+                let _ = events.send(TransportEvent::Disconnected { reason }).await;
+                if user_ended {
+                    return;
+                }
+            }
+            // `establish` already reported the failure. An initial failure is
+            // not a candidate for reconnect; a failed *re*connect keeps trying.
+            None if !connected_before => return,
+            None => {}
+        }
 
-        let reason = pump(channel, &mut input, &mut control, &output).await;
-        let _ = target.disconnect(Disconnect::ByApplication, "", "en").await;
-        reason
+        // Back off before reconnecting; the wait is cancellable and skippable.
+        match wait_backoff(&mut control, backoff).await {
+            BackoffOutcome::Elapsed | BackoffOutcome::Reconnect => {}
+            BackoffOutcome::Disconnect => return,
+        }
+        backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// Open the shell on the established target and pump it until the link ends,
+/// returning why. The `chain` is held for the duration so its jump tunnels stay
+/// up; `size` is updated by resizes so a later reconnect can reuse it.
+async fn run_connected(
+    chain: Vec<client::Handle<HostKeyHandler>>,
+    input: &mut mpsc::Receiver<Bytes>,
+    control: &mut mpsc::Receiver<ControlMsg>,
+    output: &mpsc::Sender<Bytes>,
+    events: &mpsc::Sender<TransportEvent>,
+    size: &mut (u32, u32),
+) -> DisconnectReason {
+    let Some(target) = chain.last() else {
+        return DisconnectReason::Failed("no session was established".to_owned());
     };
-    let _ = events.send(TransportEvent::Disconnected { reason }).await;
-    // Dropping `chain` (and `events`) here closes the jump sessions and the
-    // handle, which is how the UI learns the session is finished.
+    let channel = match open_shell(target, *size).await {
+        Ok(channel) => channel,
+        Err(e) => return DisconnectReason::Failed(format!("could not open shell: {e}")),
+    };
+    let _ = events.send(TransportEvent::Connected).await;
+
+    let reason = pump(channel, input, control, output, size).await;
+    let _ = target.disconnect(Disconnect::ByApplication, "", "en").await;
+    reason
+    // `chain` drops here, closing the jump sessions.
+}
+
+/// The result of waiting out a reconnect backoff.
+enum BackoffOutcome {
+    /// The delay elapsed; reconnect now.
+    Elapsed,
+    /// The user asked to reconnect immediately.
+    Reconnect,
+    /// The user (or a closed handle) ended the session; stop.
+    Disconnect,
+}
+
+/// Wait `delay` before reconnecting, while still honouring control messages:
+/// [`ControlMsg::Reconnect`] cuts the wait short, [`ControlMsg::Disconnect`]
+/// (or the UI dropping its end) stops for good.
+async fn wait_backoff(control: &mut mpsc::Receiver<ControlMsg>, delay: Duration) -> BackoffOutcome {
+    let sleep = tokio::time::sleep(delay);
+    tokio::pin!(sleep);
+    loop {
+        tokio::select! {
+            () = &mut sleep => return BackoffOutcome::Elapsed,
+            msg = control.recv() => match msg {
+                Some(ControlMsg::Reconnect) => return BackoffOutcome::Reconnect,
+                Some(ControlMsg::Disconnect) | None => return BackoffOutcome::Disconnect,
+                Some(_) => {}
+            },
+        }
+    }
 }
 
 /// One hop toward the target: a jump host, or the target itself.
@@ -221,21 +290,14 @@ async fn fail(events: &mpsc::Sender<TransportEvent>, message: String) {
         .await;
 }
 
-/// Open a session channel with an interactive PTY and a shell.
+/// Open a session channel with an interactive PTY (at `size`) and a shell.
 async fn open_shell(
     session: &client::Handle<HostKeyHandler>,
+    size: (u32, u32),
 ) -> Result<Channel<client::Msg>, russh::Error> {
     let channel = session.channel_open_session().await?;
     channel
-        .request_pty(
-            false,
-            "xterm-256color",
-            INITIAL_COLS,
-            INITIAL_ROWS,
-            0,
-            0,
-            &[],
-        )
+        .request_pty(false, "xterm-256color", size.0, size.1, 0, 0, &[])
         .await?;
     channel.request_shell(true).await?;
     Ok(channel)
@@ -477,6 +539,7 @@ async fn pump(
     input: &mut mpsc::Receiver<Bytes>,
     control: &mut mpsc::Receiver<ControlMsg>,
     output: &mpsc::Sender<Bytes>,
+    size: &mut (u32, u32),
 ) -> DisconnectReason {
     loop {
         tokio::select! {
@@ -491,7 +554,9 @@ async fn pump(
             },
             msg = control.recv() => match msg {
                 Some(ControlMsg::Resize { cols, rows }) => {
-                    let _ = channel.window_change(cols as u32, rows as u32, 0, 0).await;
+                    // Remember it too, so a reconnect opens at the same size.
+                    *size = (u32::from(cols), u32::from(rows));
+                    let _ = channel.window_change(size.0, size.1, 0, 0).await;
                 }
                 Some(ControlMsg::Disconnect) => return DisconnectReason::Local,
                 // Break/SetSignal/Reconnect do not apply to an SSH shell here yet.
