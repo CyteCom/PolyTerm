@@ -46,9 +46,15 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
-      # M3 adds serialport, which needs libudev on Linux, and M2 adds eframe,
-      # which needs the X11/Wayland development headers. Neither is a
-      # dependency yet; add the apt step here when they land.
+      # eframe/winit need the X11/Wayland/xkb development headers on Linux to
+      # compile. (M3's serialport will add libudev-dev here too.)
+      - name: linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev
 
       - name: clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
@@ -67,6 +73,12 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - name: linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev
       - run: cargo doc --workspace --no-deps
 
   # rust-version in Cargo.toml is a claim; this is what makes it true. The
@@ -79,6 +91,12 @@ jobs:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
+      - name: linux build deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libxkbcommon-dev libwayland-dev \
+            libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libx11-dev
       - run: cargo check --workspace --all-targets
 
   # NFR-11: no component with a licence incompatible with a free-software
