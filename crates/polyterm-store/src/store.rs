@@ -325,6 +325,7 @@ mod tests {
                 jumps: Vec::new(),
                 keepalive: None,
             }),
+            on_exit: polyterm_core::ExitAction::default(),
         }
     }
 
@@ -387,6 +388,7 @@ mod tests {
             name: "scratch".to_owned(),
             folder: FolderPath::root(),
             kind: SessionKind::LocalShell(PtyConfig::default()),
+            on_exit: polyterm_core::ExitAction::default(),
         };
         store.upsert_session(&spec).unwrap();
         assert_eq!(store.search("scratch").unwrap().len(), 1);

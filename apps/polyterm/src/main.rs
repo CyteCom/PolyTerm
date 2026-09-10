@@ -18,8 +18,8 @@ use std::sync::Arc;
 
 use anyhow::Context as _;
 use polyterm_core::{
-    BoxError, FlowControl, FolderPath, Parity, PtyConfig, SerialConfig, SessionId, SessionKind,
-    SessionSpec, StopBits, Transport as _, TransportHandle,
+    BoxError, ExitAction, FlowControl, FolderPath, Parity, PtyConfig, SerialConfig, SessionId,
+    SessionKind, SessionSpec, StopBits, Transport as _, TransportHandle,
 };
 use polyterm_pty::PtyTransport;
 use polyterm_serial::SerialTransport;
@@ -98,6 +98,7 @@ fn initial_session() -> anyhow::Result<SessionSpec> {
         name,
         folder: FolderPath::root(),
         kind,
+        on_exit: ExitAction::default(),
     })
 }
 

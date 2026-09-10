@@ -34,8 +34,8 @@ pub use rdp::{
 };
 pub use secret::{Secret, is_secret_field};
 pub use session::{
-    CredentialRef, FlowControl, FolderPath, Parity, PtyConfig, RdpConfig, SerialConfig, SessionId,
-    SessionKind, SessionSpec, SshAuth, SshConfig, SshJump, StopBits,
+    CredentialRef, ExitAction, FlowControl, FolderPath, Parity, PtyConfig, RdpConfig, SerialConfig,
+    SessionId, SessionKind, SessionSpec, SshAuth, SshConfig, SshJump, StopBits,
 };
 pub use transport::{
     CONTROL_CHANNEL_CAPACITY, ControlMsg, DisconnectReason, EVENT_CHANNEL_CAPACITY,

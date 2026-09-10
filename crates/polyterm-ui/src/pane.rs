@@ -19,7 +19,7 @@
 
 use bytes::Bytes;
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Sense, Vec2};
-use polyterm_core::{ControlMsg, ModemLines, TransportEvent, TransportHandle};
+use polyterm_core::{ControlMsg, ExitAction, ModemLines, TransportEvent, TransportHandle};
 use polyterm_term::{
     CursorShape, GridSize, MouseEncoding, MouseProtocol, MouseReport, Snapshot, TermEvent, Terminal,
 };
@@ -102,6 +102,12 @@ pub(crate) struct LivePane {
     /// programs set the terminal title, so a tab stays recognisable.
     label: String,
     disconnected: bool,
+    /// What to do when the session ends (FR-4). Read by the app when
+    /// [`Self::finished`] becomes true.
+    on_exit: ExitAction,
+    /// The session has ended: the transport dropped its end of the channels.
+    /// Distinct from `disconnected`, which a reconnecting link sets and clears.
+    finished: bool,
 }
 
 impl LivePane {
@@ -113,6 +119,7 @@ impl LivePane {
         rt: &Handle,
         handle: TransportHandle,
         label: String,
+        on_exit: ExitAction,
     ) -> Self {
         let TransportHandle {
             mut output,
@@ -165,7 +172,19 @@ impl LivePane {
             title: "polyterm".to_owned(),
             label,
             disconnected: false,
+            on_exit,
+            finished: false,
         }
+    }
+
+    /// Whether the session has ended (the backend dropped its channels).
+    pub(crate) fn is_finished(&self) -> bool {
+        self.finished
+    }
+
+    /// What to do when this session ends (FR-4).
+    pub(crate) fn exit_action(&self) -> ExitAction {
+        self.on_exit
     }
 
     /// The session's current title, as set by the far end (drives the window
@@ -186,21 +205,27 @@ impl LivePane {
     /// (`ARCHITECTURE.md` §6). Returns the number of output bytes fed this frame,
     /// for the app's throughput instrumentation. New output pins to the bottom.
     pub(crate) fn pump(&mut self, prompts: &mut Vec<PendingPrompt>) -> usize {
-        while let Ok(event) = self.events.try_recv() {
-            match event {
-                TransportEvent::Disconnected { .. } => {
+        loop {
+            match self.events.try_recv() {
+                Ok(TransportEvent::Disconnected { .. }) => {
                     self.disconnected = true;
                     // The lines are meaningless with no link; hide them.
                     self.modem = None;
                 }
-                TransportEvent::Connected => self.disconnected = false,
-                TransportEvent::ModemStatus(lines) => self.modem = Some(lines),
-                TransportEvent::HostKey(prompt) => prompts.push(PendingPrompt::HostKey(prompt)),
-                TransportEvent::Credential(prompt) => {
+                Ok(TransportEvent::Connected) => self.disconnected = false,
+                Ok(TransportEvent::ModemStatus(lines)) => self.modem = Some(lines),
+                Ok(TransportEvent::HostKey(prompt)) => prompts.push(PendingPrompt::HostKey(prompt)),
+                Ok(TransportEvent::Credential(prompt)) => {
                     prompts.push(PendingPrompt::Credential(prompt))
                 }
                 // Connecting / Authenticated / Error: no per-pane state yet.
-                _ => {}
+                Ok(_) => {}
+                Err(mpsc::error::TryRecvError::Empty) => break,
+                // The backend dropped its end: the session is over for good.
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    self.finished = true;
+                    break;
+                }
             }
         }
 
@@ -373,6 +398,23 @@ impl LivePane {
         // one keystrokes reach when broadcast is off (FR-90).
         if draw_focus {
             inset_border(ui, avail, 0.75, 1.5, theme.cursor);
+        }
+
+        // When the session has ended, say so over the last screen; if it is set
+        // to prompt on exit (FR-4), offer the restart/close menu.
+        if self.finished {
+            let text = match self.on_exit {
+                ExitAction::Prompt => "session ended \u{2022} [r] restart \u{2022} [Enter] close",
+                ExitAction::Close => "session ended",
+            };
+            let font = FontId::monospace((cell_h * 0.9).max(12.0));
+            let painter = ui.painter();
+            let galley = painter.layout_no_wrap(text.to_owned(), font, theme.foreground);
+            let rect = Align2::CENTER_CENTER
+                .anchor_size(avail.center(), galley.size())
+                .expand(8.0);
+            painter.rect_filled(rect, 4.0, Color32::from_black_alpha(230));
+            painter.galley(rect.min + Vec2::splat(8.0), galley, theme.foreground);
         }
 
         response

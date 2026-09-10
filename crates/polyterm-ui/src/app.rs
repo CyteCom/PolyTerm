@@ -42,8 +42,8 @@ use std::time::Instant;
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Vec2};
 use egui_tiles::{Behavior, Container, Tile, TileId, Tiles, Tree, UiResponse};
 use polyterm_core::{
-    BoxError, CredentialReply, CredentialRequest, FolderPath, KnownHostStatus, PtyConfig, Secret,
-    SessionId, SessionKind, SessionSpec, TransportHandle, TrustDecision,
+    BoxError, CredentialReply, CredentialRequest, ExitAction, FolderPath, KnownHostStatus,
+    PtyConfig, Secret, SessionId, SessionKind, SessionSpec, TransportHandle, TrustDecision,
 };
 use polyterm_store::{SessionStore, credentials};
 use serde::{Deserialize, Serialize};
@@ -358,7 +358,7 @@ impl TerminalApp {
         };
         match self.spawner.spawn(&spec) {
             Ok(handle) => {
-                let pane = LivePane::new(ctx, &self.rt, handle, spec.name.clone());
+                let pane = LivePane::new(ctx, &self.rt, handle, spec.name.clone(), spec.on_exit);
                 self.live.insert(instance, pane);
                 self.sources.insert(instance, source);
                 self.last_error = None;
@@ -433,6 +433,39 @@ impl TerminalApp {
         {
             let new_leaf = split_tile(&mut self.tree, existing, new_instance, at, dir);
             self.focused = Some(new_leaf);
+        }
+    }
+
+    /// Close tabs whose session has ended and is set to close on exit (FR-4).
+    /// Panes set to prompt are left showing their restart menu instead.
+    fn close_finished_panes(&mut self) {
+        let to_close: Vec<TileId> = self
+            .tree
+            .tiles
+            .iter()
+            .filter_map(|(id, tile)| match tile {
+                Tile::Pane(instance)
+                    if self.live.get(instance).is_some_and(|l| {
+                        l.is_finished() && l.exit_action() == ExitAction::Close
+                    }) =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .collect();
+        for tile in to_close {
+            self.close_tile(tile);
+        }
+    }
+
+    /// Restart the (ended) session in the pane keyed by `instance`, reopening
+    /// its recorded source into the same tile (FR-4 restart menu).
+    fn restart_pane(&mut self, ctx: &egui::Context, instance: SessionId) {
+        if let Some(source) = self.sources.get(&instance).cloned() {
+            // `open_source` reuses the instance id, so the tile keeps pointing
+            // at it — the dead terminal is replaced by a fresh session.
+            self.open_source(ctx, instance, source);
         }
     }
 
@@ -719,6 +752,29 @@ impl TerminalApp {
         let Some(focused) = self.focused_session() else {
             return;
         };
+
+        // A finished pane showing the restart menu (FR-4): its keys drive the
+        // menu, never a dead terminal. `r` restarts, Enter closes the tab.
+        if self.live.get(&focused).is_some_and(LivePane::is_finished) {
+            for event in &events {
+                if let Event::Key {
+                    key, pressed: true, ..
+                } = event
+                {
+                    match key {
+                        Key::R => return self.restart_pane(ctx, focused),
+                        Key::Enter => {
+                            if let Some(tile) = self.focused {
+                                self.close_tile(tile);
+                            }
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            return;
+        }
 
         let mut out: Vec<u8> = Vec::new();
         let mut copy: Option<String> = None;
@@ -1035,6 +1091,11 @@ impl eframe::App for TerminalApp {
             self.handle_prompt(prompt);
         }
 
+        // Close tabs whose session ended and are set to close on exit (FR-4);
+        // panes set to prompt keep their restart menu, handled in route_keyboard.
+        self.close_finished_panes();
+        self.validate_focus();
+
         // Keyboard/paste to the focused recipient set, before drawing so the
         // tree is free to borrow. A focus change from a click this frame takes
         // effect next frame — safe, because keystrokes never reach a pane that
@@ -1256,6 +1317,7 @@ fn local_shell_spec() -> SessionSpec {
         name: "Local shell".to_owned(),
         folder: FolderPath::root(),
         kind: SessionKind::LocalShell(PtyConfig::default()),
+        on_exit: ExitAction::default(),
     }
 }
 

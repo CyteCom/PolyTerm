@@ -12,8 +12,8 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use polyterm_core::{
-    CredentialRef, FlowControl, FolderPath, Parity, PtyConfig, RdpConfig, SerialConfig, SessionId,
-    SessionKind, SessionSpec, SshAuth, SshConfig, StopBits,
+    CredentialRef, ExitAction, FlowControl, FolderPath, Parity, PtyConfig, RdpConfig, SerialConfig,
+    SessionId, SessionKind, SessionSpec, SshAuth, SshConfig, StopBits,
 };
 
 /// The host (or port, for serial) a session connects to, for search and display.
@@ -134,6 +134,7 @@ pub(crate) struct SessionEditor {
     name: String,
     folder: String,
     kind: KindTag,
+    on_exit: ExitAction,
     error: Option<String>,
 
     // Per-kind fields, reused across kinds so switching does not lose input.
@@ -158,6 +159,7 @@ impl Default for SessionEditor {
             name: String::new(),
             folder: String::new(),
             kind: KindTag::Ssh,
+            on_exit: ExitAction::default(),
             error: None,
             shell: String::new(),
             serial_port: String::new(),
@@ -190,6 +192,7 @@ impl SessionEditor {
             is_new: false,
             name: spec.name.clone(),
             folder: folder_to_string(&spec.folder),
+            on_exit: spec.on_exit,
             ..Self::default()
         };
         match &spec.kind {
@@ -298,6 +301,7 @@ impl SessionEditor {
             name: name.to_owned(),
             folder: parse_folder(&self.folder),
             kind,
+            on_exit: self.on_exit,
         })
     }
 
@@ -334,6 +338,13 @@ impl SessionEditor {
                             ui.selectable_value(&mut self.kind, KindTag::Serial, "Serial");
                             ui.selectable_value(&mut self.kind, KindTag::LocalShell, "Local shell");
                             ui.selectable_value(&mut self.kind, KindTag::Rdp, "RDP");
+                        });
+                        ui.end_row();
+
+                        ui.label("On exit");
+                        ui.horizontal(|ui| {
+                            ui.selectable_value(&mut self.on_exit, ExitAction::Prompt, "Show menu");
+                            ui.selectable_value(&mut self.on_exit, ExitAction::Close, "Close tab");
                         });
                         ui.end_row();
 
@@ -476,6 +487,7 @@ mod tests {
                 jumps: Vec::new(),
                 keepalive: None,
             }),
+            on_exit: ExitAction::default(),
         }
     }
 

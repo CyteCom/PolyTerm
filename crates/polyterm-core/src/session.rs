@@ -81,6 +81,22 @@ pub struct SessionSpec {
     /// Position in the session tree.
     pub folder: FolderPath,
     pub kind: SessionKind,
+    /// What to do when the session ends. `#[serde(default)]` so sessions saved
+    /// before this field existed still load.
+    #[serde(default)]
+    pub on_exit: ExitAction,
+}
+
+/// What happens to a tab when its session ends (the shell exits, or the far end
+/// closes). Chosen per session (FR-4 territory; the setting lives on the spec).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum ExitAction {
+    /// Keep the tab open with a small menu: `r` restarts the session, `Enter`
+    /// closes the tab. The default — a tab is never lost without a keystroke.
+    #[default]
+    Prompt,
+    /// Close the tab as soon as the session ends.
+    Close,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
