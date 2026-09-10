@@ -47,7 +47,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # eframe/winit need the X11/Wayland/xkb development headers on Linux to
-      # compile. (M3's serialport will add libudev-dev here too.)
+      # compile. serialport builds without libudev (ADR-14), so it needs no extra deps.
       - name: linux build deps
         if: runner.os == 'Linux'
         run: |

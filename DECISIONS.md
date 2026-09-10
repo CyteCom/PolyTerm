@@ -306,3 +306,23 @@ tabs, which is why FR-93 requires them to be marked as receiving.
 
 **Revisit if.** Users routinely need to broadcast to sessions they do not want adjacent on
 screen. Try FR-97 (named layouts) before reintroducing a selection model.
+
+---
+
+## ADR-14 · Accepted · `serialport` without its `libudev` feature
+
+**Decision.** Depend on `serialport` with `default-features = false`, which drops its
+optional `libudev` C dependency. Linux port enumeration uses the crate's pure-Rust sysfs
+fallback instead.
+
+**Why.** `libudev` is a C library, and pulling it in would put a C build dependency on the
+Linux target — the exact property the whole stack was chosen to avoid (ADR-1, NFR-2). The
+feature is optional, and the sysfs fallback still yields port names and enough device
+detail to satisfy FR-45 ("device description where the OS provides one"). Keeping the
+build pure Rust is worth more than the marginal extra USB metadata `libudev` would supply.
+
+**Rejected.** Enabling `libudev` for richer Linux descriptions. Reconsider only if the
+sysfs data proves too thin to tell two adapters apart in practice.
+
+**Consequence.** CI needs no `libudev-dev`. Windows and macOS are unaffected — their
+backends are target-gated, not behind this feature.

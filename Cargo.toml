@@ -54,7 +54,7 @@ alacritty_terminal = "0.26"   # (unused until M2)
 # instead. Do not reintroduce it.
 russh        = "0.63"         # (unused until M5)
 russh-sftp   = "3"            # (unused until M7; pairing with russh 0.63 is unverified)
-serialport   = "4.10"         # (unused until M3)
+serialport   = { version = "4.10", default-features = false }  # no libudev: keep pure-Rust (see DECISIONS)
 portable-pty = "0.9"          # (unused until M2)
 
 # --- rdp ---------------------------------------------------------------------
