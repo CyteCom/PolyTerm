@@ -14,9 +14,10 @@
 //! elsewhere; this crate has neither.
 //!
 //! What is here: password, public-key (including encrypted keys, via a
-//! passphrase prompt), and keyboard-interactive authentication. Agent auth
-//! (FR-22), jump hosts (FR-28), and automatic reconnect (FR-29) are follow-ups;
-//! the shape below is what they build on.
+//! passphrase prompt), keyboard-interactive, and agent authentication — the
+//! agent being the Unix socket on Linux and the OpenSSH named pipe or Pageant
+//! on Windows (FR-22). Jump hosts (FR-28) and automatic reconnect (FR-29) are
+//! follow-ups; the shape below is what they build on.
 
 #![forbid(unsafe_code)]
 
@@ -29,6 +30,7 @@ use polyterm_core::{
     TransportError, TransportEvent, TransportHandle, TransportKind, TrustDecision,
 };
 use russh::client::{self, Handler, KeyboardInteractiveAuthResponse};
+use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key, ssh_key};
 use russh::{Channel, ChannelMsg, Disconnect};
 use tokio::runtime::Handle;
@@ -176,17 +178,94 @@ async fn authenticate(
                 .success())
         }
         SshAuth::KeyboardInteractive => keyboard_interactive(session, &user, events).await,
-        SshAuth::Agent => {
-            // FR-22, a follow-up: the Windows agent is a named pipe / Pageant,
-            // not a Unix socket, and needs its own transport code.
+        SshAuth::Agent => agent_auth(session, &user, events).await,
+    }
+}
+
+/// The SSH agent with its stream type erased, so the Unix, named-pipe, and
+/// Pageant agents share one code path.
+type DynAgent = AgentClient<Box<dyn AgentStream + Send + Unpin>>;
+
+/// Connect to the platform's SSH agent (FR-22).
+#[cfg(unix)]
+async fn connect_agent() -> Result<DynAgent, String> {
+    // `SSH_AUTH_SOCK` names the Unix-domain socket.
+    AgentClient::connect_env()
+        .await
+        .map(|agent| agent.dynamic())
+        .map_err(|e| e.to_string())
+}
+
+/// Connect to the platform's SSH agent (FR-22): the OpenSSH named-pipe agent
+/// first, then Pageant.
+#[cfg(windows)]
+async fn connect_agent() -> Result<DynAgent, String> {
+    match AgentClient::connect_named_pipe(r"\\.\pipe\openssh-ssh-agent").await {
+        Ok(agent) => Ok(agent.dynamic()),
+        Err(_) => AgentClient::connect_pageant()
+            .await
+            .map(|agent| agent.dynamic())
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Authenticate by asking the SSH agent to sign for each identity it holds
+/// until one is accepted (FR-22). The agent never releases the private key; it
+/// signs on request. A missing agent or no identities fails cleanly.
+async fn agent_auth(
+    session: &mut client::Handle<HostKeyHandler>,
+    user: &str,
+    events: &mpsc::Sender<TransportEvent>,
+) -> Result<bool, russh::Error> {
+    let mut agent = match connect_agent().await {
+        Ok(agent) => agent,
+        Err(e) => {
             let _ = events
-                .send(TransportEvent::Error(TransportError::Config(
-                    "SSH agent authentication is not implemented yet".to_owned(),
-                )))
+                .send(TransportEvent::Error(TransportError::Unavailable(format!(
+                    "no SSH agent: {e}"
+                ))))
                 .await;
-            Ok(false)
+            return Ok(false);
+        }
+    };
+    let identities = match agent.request_identities().await {
+        Ok(identities) => identities,
+        Err(e) => {
+            let _ = events
+                .send(TransportEvent::Error(TransportError::Unavailable(format!(
+                    "could not list agent keys: {e}"
+                ))))
+                .await;
+            return Ok(false);
+        }
+    };
+    if identities.is_empty() {
+        let _ = events
+            .send(TransportEvent::Error(TransportError::Auth {
+                reason: "the SSH agent has no identities".to_owned(),
+            }))
+            .await;
+        return Ok(false);
+    }
+
+    let rsa_hash = session.best_supported_rsa_hash().await?.flatten();
+    for identity in &identities {
+        let key = identity.public_key().into_owned();
+        // The hash algorithm only applies to RSA keys (rsa-sha2-256/512).
+        let hash = if matches!(key.algorithm(), ssh_key::Algorithm::Rsa { .. }) {
+            rsa_hash
+        } else {
+            None
+        };
+        if let Ok(result) = session
+            .authenticate_publickey_with(user.to_owned(), key, hash, &mut agent)
+            .await
+            && result.success()
+        {
+            return Ok(true);
         }
     }
+    Ok(false)
 }
 
 /// Run the keyboard-interactive exchange, emitting a [`CredentialPrompt`] for
