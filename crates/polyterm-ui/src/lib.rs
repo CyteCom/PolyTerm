@@ -1,9 +1,11 @@
 //! The egui shell.
 //!
-//! For M2 this is a single terminal pane over one session. Tiles, tab groups,
-//! and the session tree arrive at M4; the input fan-out for tile-scoped
-//! multi-exec (`ARCHITECTURE.md` §10) lands with them and lives here, never in
-//! a backend.
+//! The content area is an `egui_tiles` tree (ADR-12): its leaves are sessions,
+//! and each session's live terminal is a `pane::LivePane` held in a side map.
+//! A single session opens as one pane; splits, tab groups, and the session tree
+//! fill in through M4. The input fan-out for tile-scoped multi-exec
+//! (`ARCHITECTURE.md` §10) lives in the `app` module, never in a backend, and
+//! FR-90's isolation is a single downward tree walk.
 //!
 //! This crate must never name `russh`, `serialport`, `portable-pty`, or
 //! `ironrdp` (ADR-11). It consumes the protocol-erased [`TransportHandle`] and
@@ -13,6 +15,7 @@
 
 mod app;
 mod palette;
+mod pane;
 mod session_log;
 
 pub use app::TerminalApp;

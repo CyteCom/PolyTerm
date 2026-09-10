@@ -44,6 +44,11 @@ eframe       = { version = "0.36", default-features = false, features = [
     "accesskit",     # groundwork for NFR-13 keyboard/AT navigation
 ] }
 egui         = "0.36"         # (unused until M2)
+# Tiling: splits, grid, resizable dividers, drag-to-rearrange, tab groups, and
+# a serde-serialisable layout tree (FR-85..98, ADR-12). Tracks egui ^0.36. Pure
+# Rust, no C toolchain. Input isolation (FR-90) is layered on top in polyterm-ui,
+# not a behaviour of this crate — it reads no keyboard input during typing.
+egui_tiles   = "0.17"
 
 # --- terminal ----------------------------------------------------------------
 alacritty_terminal = "0.26"   # (unused until M2)

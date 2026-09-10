@@ -13,6 +13,7 @@ polyterm-store = { path = "../polyterm-store" }
 polyterm-term = { path = "../polyterm-term" }
 eframe = { workspace = true }
 egui = { workspace = true }
+egui_tiles = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }

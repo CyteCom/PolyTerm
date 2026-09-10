@@ -370,6 +370,17 @@ serialised form of the tree (FR-95) alongside the session tree, referencing sess
 `SessionId`. A restored layout naming a session that no longer exists drops that leaf and
 loads the rest; it does not fail the restore.
 
+The tree above is the **conceptual model**; the implementation realizes it with
+`egui_tiles` 0.17.1 (DECISIONS ADR-12). `egui_tiles` generalises the binary split into an
+n-ary linear container (its `Tabs` container is our tab-group leaf, exposing
+`children: Vec<TileId>` and `active: Option<TileId>`), which is a superset of the binary
+form and needs no special-casing here. Its `Tree<Pane>` is `serde`-serialisable for FR-95;
+our `Pane` payload carries the `SessionId`, keeping the restore contract above intact.
+Critically for §10.2, `egui_tiles` has no focus or input-routing model of its own — it
+lays out, draws, and handles pointer drag-drop, and reads no keyboard input during typing —
+so the input path below is entirely ours to build, not a behaviour of the crate we must
+suppress.
+
 Every tab in a group is **live**, not just the visible one. A background tab keeps its
 transport, keeps draining output into its `Term`, and keeps its grid current. That is what
 makes broadcasting to a tab you cannot see meaningful — and it is why FR-93 requires

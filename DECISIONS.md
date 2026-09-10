@@ -266,13 +266,42 @@ serialises a tree, not a screenshot.
   layer is where the fighting happens; adopting a heavyweight docking crate makes the ADR-3
   revisit condition harder to exercise, not easier.
 
-**Open.** `egui_tiles` is the obvious candidate crate and would save real work, but it is a
-dependency decision under §5 of `CLAUDE.md` and has not been taken. Evaluate it at M4
-against writing the tree ourselves — the deciding question is whether its focus and
-drag-drop model can be constrained to satisfy FR-90, not whether it draws splitters.
+**Realized with `egui_tiles` 0.17.1** (evaluated and adopted at M4). The deciding
+question — whether its focus and drag-drop model can be constrained to satisfy FR-90 —
+resolved decisively in its favour: *`egui_tiles` has no focus or input-routing model at
+all.* It lays out and draws tiles and drives pointer-driven drag-drop; it never reads
+keyboard input except one `Key::Escape` peek used solely to cancel an in-progress drag
+(never during typing, and not consumed). A terminal receives a keystroke only because our
+own `Behavior::pane_ui` reads `ctx.input()` — so FR-90 isolation is not a constraint we
+impose on the crate but a gate we write in our own pane hook, keyed on a focused tile we
+track ourselves. There is no competing input path that could leak across a tile boundary.
 
-**Revisit if.** M4 shows the tree cannot be driven from `egui`'s immediate-mode input
-handling without per-frame layout thrash.
+What the crate supplies that hand-rolling would have cost: linear (h/v) and grid split
+layout, resizable dividers with hit-testing, the full drag-to-rearrange interaction (drop
+zones, previews, insertion), scrolling tab bars, tree simplification, and `serde` on
+`Tree<Pane>` (FR-95). What remains ours in both worlds and sits cleanly on top of
+`pane_ui`: the focused-tile model + FR-90 gate, multi-exec broadcast (FR-96–98), and the
+`Pane`→terminal glue. Its `Tabs` container exposes `children: Vec<TileId>` and
+`active: Option<TileId>` as public fields, which is exactly what the recipient-set walk
+(§10.2) and the "every tab is live" rule (§10.1) need. Version 0.17.1 tracks egui `^0.36`,
+matching our pin; it is pure Rust and adds no C toolchain requirement.
+
+**Rejected (additionally).**
+
+- **Hand-rolling the tree** per `ARCHITECTURE.md` §10.1's `Tile` enum. Full control of the
+  layout traversal, but it buys control over code the safety property never touches —
+  FR-90 lives in our `pane_ui`, not in the crate's layout walk — at the price of
+  reimplementing the drag-drop, resize, tab-bar, and persistence machinery `egui_tiles`
+  already ships. The §10.1 enum stays as the conceptual model; `egui_tiles` realizes it.
+
+**Consequence to accept.** One load-bearing dependency, pinned to `egui_tiles`'s release
+cadence for future egui bumps (it has tracked egui 0.32→0.36 promptly). Our persisted
+layout format becomes partly `egui_tiles`'s, mitigated by using our own `SessionId` as the
+`Pane` payload so a restore can rebuild against the session store (§10.1, FR-95).
+
+**Revisit if.** `egui_tiles` falls behind an egui release we must take, or M4 shows the
+tree cannot be driven from `egui`'s immediate-mode input handling without per-frame layout
+thrash. ADR-3's revisit condition still applies: this layer is where the fighting happens.
 
 ---
 
