@@ -23,6 +23,11 @@ allow = [
     "MPL-2.0",
     "CC0-1.0",
     "Unlicense",
+    # Font licences for egui's bundled default fonts (Hack, Ubuntu family).
+    # Both are OSI-/FSF-recognised free licences, fine for a free-software
+    # release (NFR-11).
+    "OFL-1.1",
+    "Ubuntu-font-1.0",
 ]
 
 [bans]

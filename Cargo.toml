@@ -35,7 +35,14 @@ bytes        = "1.12"
 
 # --- ui ----------------------------------------------------------------------
 # eframe pinned to the wgpu backend; the glow backend is not supported here.
-eframe       = { version = "0.36", default-features = false, features = ["wgpu", "persistence"] }  # (unused until M2)
+eframe       = { version = "0.36", default-features = false, features = [
+    "wgpu",          # GPU backend; the glow/GL backend is deliberately left off
+    "persistence",
+    "default_fonts", # egui's built-in fonts, including the monospace face
+    "x11",           # Linux windowing backends (winit will not compile without one)
+    "wayland",
+    "accesskit",     # groundwork for NFR-13 keyboard/AT navigation
+] }
 egui         = "0.36"         # (unused until M2)
 
 # --- terminal ----------------------------------------------------------------
