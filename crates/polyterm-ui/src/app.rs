@@ -11,13 +11,41 @@
 //! this thread ever blocks on the runtime.
 
 use bytes::Bytes;
-use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Vec2};
+use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Sense, Vec2};
 use polyterm_core::{ControlMsg, TransportEvent, TransportHandle};
 use polyterm_term::{CursorShape, GridSize, Snapshot, TermEvent, Terminal};
 use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::palette::Theme;
+
+/// A cell position in viewport coordinates: `(row, col)`, row-major so that
+/// tuple ordering is reading order.
+type Cell = (u16, u16);
+
+/// A text selection, as the anchor where the drag began and the moving head.
+/// Ordering the two into reading order is done at use.
+#[derive(Debug, Clone, Copy)]
+struct Selection {
+    anchor: Cell,
+    head: Cell,
+}
+
+impl Selection {
+    /// The selection as an ordered `(start, end)` pair in reading order.
+    fn ordered(&self) -> (Cell, Cell) {
+        if self.anchor <= self.head {
+            (self.anchor, self.head)
+        } else {
+            (self.head, self.anchor)
+        }
+    }
+
+    fn contains(&self, cell: Cell) -> bool {
+        let (start, end) = self.ordered();
+        cell >= start && cell <= end
+    }
+}
 
 /// Default scrollback, matching FR-12's default of 10,000 lines.
 const SCROLLBACK: usize = 10_000;
@@ -43,6 +71,8 @@ pub struct TerminalApp {
 
     /// Last grid size we told the transport about, to avoid redundant resizes.
     last_size: GridSize,
+    /// The active mouse selection, if any (FR-14).
+    selection: Option<Selection>,
     title: String,
     /// The title currently applied to the window, so it is set only on change.
     applied_title: String,
@@ -98,6 +128,7 @@ impl TerminalApp {
             output: ui_output_rx,
             events: ui_events_rx,
             last_size: initial,
+            selection: None,
             title: "polyterm".to_owned(),
             applied_title: String::new(),
             disconnected: false,
@@ -145,14 +176,33 @@ impl TerminalApp {
         }
     }
 
-    /// Translate this frame's input into bytes for the far end.
-    fn pump_input(&mut self, ctx: &egui::Context) {
+    /// Translate this frame's keyboard and clipboard input into bytes for the
+    /// far end, and service copy/paste against the system clipboard (FR-14).
+    ///
+    /// `snapshot` is needed because a copy reads the selected cells from the
+    /// grid as currently displayed.
+    fn handle_keyboard(&mut self, ctx: &egui::Context, snapshot: &Snapshot) {
         let events = ctx.input(|i| i.events.clone());
         let mut out = Vec::new();
         for event in events {
             match event {
                 Event::Text(text) => out.extend_from_slice(text.as_bytes()),
                 Event::Paste(text) => out.extend_from_slice(text.as_bytes()),
+                // Ctrl+C (and Ctrl+Shift+C) reach us as `Copy`: egui-winit turns
+                // the shortcut into this event and emits no key press for it. In
+                // a terminal it copies when there is a selection and is the
+                // interrupt (0x03) otherwise — what Windows Terminal and others
+                // do. A copy also clears the selection, so a second Ctrl+C then
+                // interrupts.
+                Event::Copy | Event::Cut => {
+                    match self.selection.and_then(|s| selection_text(s, snapshot)) {
+                        Some(text) => {
+                            ctx.copy_text(text);
+                            self.selection = None;
+                        }
+                        None => out.push(0x03),
+                    }
+                }
                 Event::Key {
                     key,
                     pressed: true,
@@ -169,6 +219,52 @@ impl TerminalApp {
         if !out.is_empty() {
             let _ = self.input.try_send(Bytes::from(out));
             self.terminal.scroll_to_bottom();
+            // Typing dismisses the selection, as in every terminal.
+            self.selection = None;
+        }
+    }
+
+    /// Update the selection from this frame's pointer interaction, and copy on
+    /// release (copy-on-selection, FR-14).
+    fn handle_pointer(
+        &mut self,
+        ctx: &egui::Context,
+        response: &egui::Response,
+        snapshot: &Snapshot,
+        origin: Pos2,
+        cell_w: f32,
+        cell_h: f32,
+    ) {
+        let to_cell = |pos: Pos2| -> Cell {
+            let col = ((pos.x - origin.x) / cell_w).floor();
+            let row = ((pos.y - origin.y) / cell_h).floor();
+            let col = col.clamp(0.0, snapshot.size.cols.saturating_sub(1) as f32) as u16;
+            let row = row.clamp(0.0, snapshot.size.rows.saturating_sub(1) as f32) as u16;
+            (row, col)
+        };
+
+        if response.drag_started() {
+            if let Some(pos) = response.interact_pointer_pos() {
+                let cell = to_cell(pos);
+                self.selection = Some(Selection {
+                    anchor: cell,
+                    head: cell,
+                });
+            }
+        } else if response.dragged()
+            && let Some(pos) = response.interact_pointer_pos()
+            && let Some(sel) = self.selection.as_mut()
+        {
+            sel.head = to_cell(pos);
+        } else if response.drag_stopped()
+            && let Some(text) = self.selection.and_then(|s| selection_text(s, snapshot))
+        {
+            ctx.copy_text(text);
+        }
+
+        // A plain click (no drag) clears the selection.
+        if response.clicked() {
+            self.selection = None;
         }
     }
 
@@ -194,7 +290,6 @@ impl eframe::App for TerminalApp {
 
         self.pump_events();
         self.pump_output();
-        self.pump_input(&ctx);
 
         if self.title != self.applied_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(self.title.clone()));
@@ -234,6 +329,12 @@ impl eframe::App for TerminalApp {
         }
 
         let snapshot = self.terminal.snapshot();
+
+        // Mouse selection and copy-on-release (FR-14), then keyboard/clipboard.
+        let response = ui.allocate_rect(avail, Sense::click_and_drag());
+        self.handle_pointer(&ctx, &response, &snapshot, avail.min, cell_w, cell_h);
+        self.handle_keyboard(&ctx, &snapshot);
+
         self.paint(ui, avail.min, cell_w, cell_h, &font, &snapshot);
     }
 }
@@ -266,6 +367,13 @@ impl TerminalApp {
                 }
                 if cell.attrs.hidden {
                     fg = bg;
+                }
+
+                let selected = self
+                    .selection
+                    .is_some_and(|s| s.contains((row_idx as u16, col_idx as u16)));
+                if selected {
+                    bg = self.theme.selection;
                 }
 
                 // Only paint a background that differs from the panel fill;
@@ -331,6 +439,35 @@ impl TerminalApp {
     }
 }
 
+/// The text of `selection` over `snapshot`, right-trimmed per line and joined
+/// by newlines. `None` if the selection is empty. A linear (reading-order)
+/// selection: full-width rows in the middle, partial rows at the ends.
+fn selection_text(selection: Selection, snapshot: &Snapshot) -> Option<String> {
+    let (start, end) = selection.ordered();
+    let cols = snapshot.size.cols;
+    let mut lines = Vec::new();
+    for row in start.0..=end.0 {
+        let line = snapshot.lines.get(row as usize)?;
+        let first = if row == start.0 { start.1 } else { 0 };
+        let last = if row == end.0 {
+            end.1
+        } else {
+            cols.saturating_sub(1)
+        };
+        let text: String = (first..=last)
+            .filter_map(|c| line.cells.get(c as usize))
+            .map(|cell| cell.c)
+            .collect();
+        lines.push(text.trim_end().to_owned());
+    }
+    let joined = lines.join("\n");
+    if joined.is_empty() {
+        None
+    } else {
+        Some(joined)
+    }
+}
+
 /// Encode a non-text key press into the bytes a terminal expects. Returns
 /// `None` for keys whose character already arrives as [`Event::Text`].
 fn encode_key(key: Key, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
@@ -377,6 +514,84 @@ fn encode_key(key: Key, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polyterm_term::{Attrs, Cell as TermCell, Color, Cursor, Damage, Line};
+
+    fn snapshot_from(rows: &[&str]) -> Snapshot {
+        let cols = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0) as u16;
+        let lines = rows
+            .iter()
+            .map(|r| {
+                let mut cells: Vec<TermCell> = r
+                    .chars()
+                    .map(|c| TermCell {
+                        c,
+                        fg: Color::Foreground,
+                        bg: Color::Background,
+                        attrs: Attrs::default(),
+                        wide: false,
+                    })
+                    .collect();
+                cells.resize(cols as usize, TermCell::default());
+                Line { cells }
+            })
+            .collect();
+        Snapshot {
+            size: GridSize::new(cols, rows.len() as u16),
+            lines,
+            cursor: Cursor {
+                line: 0,
+                col: 0,
+                visible: true,
+                shape: CursorShape::Block,
+            },
+            damage: Damage::Full,
+            display_offset: 0,
+        }
+    }
+
+    fn sel(anchor: Cell, head: Cell) -> Selection {
+        Selection { anchor, head }
+    }
+
+    #[test]
+    fn single_row_selection_extracts_the_span() {
+        let snap = snapshot_from(&["hello world"]);
+        // Columns 0..=4 → "hello".
+        let text = selection_text(sel((0, 0), (0, 4)), &snap);
+        assert_eq!(text.as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn selection_is_order_independent() {
+        let snap = snapshot_from(&["hello world"]);
+        let forward = selection_text(sel((0, 0), (0, 4)), &snap);
+        let backward = selection_text(sel((0, 4), (0, 0)), &snap);
+        assert_eq!(forward, backward);
+    }
+
+    #[test]
+    fn multi_row_selection_joins_with_newlines_and_trims() {
+        let snap = snapshot_from(&["abc   ", "defgh", "ij"]);
+        // From row 0 col 0 through row 2 col 1: first row full (trimmed),
+        // middle row full, last row cols 0..=1.
+        let text = selection_text(sel((0, 0), (2, 1)), &snap);
+        assert_eq!(text.as_deref(), Some("abc\ndefgh\nij"));
+    }
+
+    #[test]
+    fn blank_selection_is_none() {
+        let snap = snapshot_from(&["   "]);
+        assert_eq!(selection_text(sel((0, 0), (0, 2)), &snap), None);
+    }
+
+    #[test]
+    fn selection_contains_is_reading_order() {
+        let s = sel((1, 3), (2, 1));
+        assert!(s.contains((1, 5))); // after start on the first row
+        assert!(s.contains((2, 0))); // before end on the last row
+        assert!(!s.contains((1, 2))); // before start
+        assert!(!s.contains((2, 2))); // after end
+    }
 
     #[test]
     fn ctrl_letter_maps_to_control_code() {
