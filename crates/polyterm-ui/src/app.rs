@@ -1015,7 +1015,17 @@ impl eframe::App for TerminalApp {
         // tree is free to borrow. A focus change from a click this frame takes
         // effect next frame — safe, because keystrokes never reach a pane that
         // was not focused when they were typed.
-        self.route_keyboard(&ctx);
+        //
+        // Never while a dialog or a text field owns the keyboard: otherwise
+        // everything typed into the session editor or a credential prompt — a
+        // password, a passphrase — would ALSO reach the focused terminal and be
+        // echoed there in cleartext. `egui_wants_keyboard_input` is true exactly
+        // when some widget (a `TextEdit`) is focused; the terminal is painted,
+        // not a focusable widget, so it never trips it.
+        let dialog_open = self.editor.is_some() || self.modal.is_some();
+        if !dialog_open && !ctx.egui_wants_keyboard_input() {
+            self.route_keyboard(&ctx);
+        }
 
         // The window title follows the focused pane's live title.
         let title = self
