@@ -304,7 +304,14 @@ backend ──Credential───► binary looks `credential` up in the keyring
 ```
 
 This is why `known_host_status` is not a field of the prompt: the transport does not know
-it. `KnownHostStatus` is what the binary attaches when a prompt has to go up to the UI.
+it. `KnownHostStatus` is what the answerer attaches when a prompt has to go up to the UI.
+
+**Where the answerer actually lives.** This section predates ADR-15, which handed the
+`SessionStore` to `polyterm-ui` and made the UI the owner of the session lifecycle. The UI
+therefore has the store and the keyring (through `polyterm-store`) in reach and drains the
+`events` channel itself, so the answering — look the key up, look the credential up, escalate
+only a miss to a modal — happens there (`polyterm-ui`'s `prompts` module), not in a separate
+binary-side step. The division of labour is exactly as drawn above; only its address changed.
 
 ### 6.2 Consequences
 

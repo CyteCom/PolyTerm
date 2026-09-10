@@ -20,6 +20,7 @@
 mod app;
 mod palette;
 mod pane;
+mod prompts;
 mod session_log;
 mod sessions;
 

@@ -27,6 +27,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::palette::Theme;
+use crate::prompts::PendingPrompt;
 use crate::session_log::{SessionLog, default_log_path};
 
 /// A cell position in viewport coordinates: `(row, col)`, row-major so that
@@ -180,9 +181,11 @@ impl LivePane {
 
     /// Drain lifecycle events and transport output into the terminal, and
     /// forward anything the terminal wants written back (device-query replies,
-    /// chiefly). Returns the number of output bytes fed this frame, for the
-    /// app's throughput instrumentation. New output pins the view to the bottom.
-    pub(crate) fn pump(&mut self) -> usize {
+    /// chiefly). Prompts the backend raises are collected into `prompts` for the
+    /// app to answer — this pane cannot, having no store or keyring
+    /// (`ARCHITECTURE.md` §6). Returns the number of output bytes fed this frame,
+    /// for the app's throughput instrumentation. New output pins to the bottom.
+    pub(crate) fn pump(&mut self, prompts: &mut Vec<PendingPrompt>) -> usize {
         while let Ok(event) = self.events.try_recv() {
             match event {
                 TransportEvent::Disconnected { .. } => {
@@ -192,8 +195,11 @@ impl LivePane {
                 }
                 TransportEvent::Connected => self.disconnected = false,
                 TransportEvent::ModemStatus(lines) => self.modem = Some(lines),
-                // Connecting / Authenticated / prompts: nothing for a local
-                // shell in M2.
+                TransportEvent::HostKey(prompt) => prompts.push(PendingPrompt::HostKey(prompt)),
+                TransportEvent::Credential(prompt) => {
+                    prompts.push(PendingPrompt::Credential(prompt))
+                }
+                // Connecting / Authenticated / Error: no per-pane state yet.
                 _ => {}
             }
         }

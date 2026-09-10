@@ -15,7 +15,7 @@ const SEP: char = '\u{1f}';
 /// The saved session tree. Wraps one SQLite connection; cheap to construct.
 #[derive(Debug)]
 pub struct SessionStore {
-    conn: Connection,
+    pub(crate) conn: Connection,
 }
 
 impl SessionStore {
@@ -54,7 +54,14 @@ impl SessionStore {
                  host   TEXT,
                  spec   TEXT NOT NULL
              ) WITHOUT ROWID;
-             CREATE INDEX IF NOT EXISTS idx_sessions_folder ON sessions(folder);",
+             CREATE INDEX IF NOT EXISTS idx_sessions_folder ON sessions(folder);
+             CREATE TABLE IF NOT EXISTS known_hosts (
+                 host     TEXT NOT NULL,
+                 port     INTEGER NOT NULL,
+                 key_type TEXT NOT NULL,
+                 key      BLOB NOT NULL,
+                 PRIMARY KEY (host, port, key_type)
+             ) WITHOUT ROWID;",
         )?;
         Ok(Self { conn })
     }

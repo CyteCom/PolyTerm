@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 pub mod credentials;
+mod known_hosts;
 mod store;
 
 pub use store::SessionStore;

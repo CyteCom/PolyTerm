@@ -23,6 +23,7 @@ use polyterm_core::{
 };
 use polyterm_pty::PtyTransport;
 use polyterm_serial::SerialTransport;
+use polyterm_ssh::SshTransport;
 use polyterm_store::SessionStore;
 use polyterm_ui::SessionSpawner;
 use tokio::runtime::Handle;
@@ -40,7 +41,7 @@ impl SessionSpawner for BackendSpawner {
         match &spec.kind {
             SessionKind::LocalShell(cfg) => Ok(PtyTransport.spawn(&self.rt, cfg.clone())?),
             SessionKind::Serial(cfg) => Ok(SerialTransport.spawn(&self.rt, cfg.clone())?),
-            SessionKind::Ssh(_) => Err("SSH sessions are not implemented yet (M5)".into()),
+            SessionKind::Ssh(cfg) => Ok(SshTransport.spawn(&self.rt, cfg.clone())?),
             SessionKind::Rdp(_) => {
                 Err("RDP is a remote-desktop session, not a terminal (M8)".into())
             }
@@ -112,6 +113,12 @@ fn main() -> anyhow::Result<()> {
     let rt = runtime.handle().clone();
 
     let spawner: Arc<dyn SessionSpawner> = Arc::new(BackendSpawner { rt: rt.clone() });
+
+    // Select the OS keyring up front so credential lookups have a store to
+    // consult (ADR-8). A failure is not fatal — the UI just prompts every time.
+    if let Err(e) = polyterm_store::credentials::init() {
+        tracing::warn!(error = %e, "OS keyring unavailable; SSH credentials will be prompted every time");
+    }
 
     // A missing session store is not fatal: we can still open local shells.
     let store = match SessionStore::open_default() {

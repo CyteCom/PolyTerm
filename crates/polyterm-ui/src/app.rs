@@ -41,14 +41,16 @@ use std::time::Instant;
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Vec2};
 use egui_tiles::{Behavior, Container, Tile, TileId, Tiles, Tree, UiResponse};
 use polyterm_core::{
-    BoxError, FolderPath, PtyConfig, SessionId, SessionKind, SessionSpec, TransportHandle,
+    BoxError, CredentialReply, CredentialRequest, FolderPath, KnownHostStatus, PtyConfig, Secret,
+    SessionId, SessionKind, SessionSpec, TransportHandle, TrustDecision,
 };
-use polyterm_store::SessionStore;
+use polyterm_store::{SessionStore, credentials};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
 use crate::palette::Theme;
 use crate::pane::{LivePane, encode_key};
+use crate::prompts::{ModalAnswer, PendingPrompt, PromptModal};
 use crate::sessions::{
     EditorOutcome, FolderNode, SessionEditor, build_folder_tree, matches_query, parse_folder,
 };
@@ -175,6 +177,10 @@ pub struct TerminalApp {
     new_folder_name: String,
     /// The open new/edit-session form, if any (FR-5).
     editor: Option<SessionEditor>,
+    /// The prompt currently asking the user for an answer (FR-23, §6), and any
+    /// waiting behind it (a second session connecting at once).
+    modal: Option<PromptModal>,
+    modal_queue: VecDeque<PromptModal>,
     /// Whether the session panel is shown. Forced on while nothing is open.
     show_panel: bool,
     /// Whether to restore the tile layout on startup (FR-4 opt-in). Persisted.
@@ -298,6 +304,8 @@ impl TerminalApp {
             search: String::new(),
             new_folder_name: String::new(),
             editor: None,
+            modal: None,
+            modal_queue: VecDeque::new(),
             show_panel: true,
             restore_enabled,
             last_error: None,
@@ -491,6 +499,104 @@ impl TerminalApp {
             PanelAction::DeleteFolder(path) => {
                 self.store_op(move |store| store.delete_folder(&path));
             }
+        }
+    }
+
+    /// Answer a prompt a backend raised (§6). A host key already trusted, or a
+    /// password already in the keyring, is answered silently; everything else
+    /// becomes a modal the user must resolve.
+    fn handle_prompt(&mut self, prompt: PendingPrompt) {
+        match prompt {
+            PendingPrompt::HostKey(prompt) => {
+                let status = self
+                    .store
+                    .as_ref()
+                    .and_then(|s| {
+                        s.known_host_status(
+                            &prompt.host,
+                            prompt.port,
+                            &prompt.key_type,
+                            &prompt.public_key,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or(KnownHostStatus::Unknown);
+                if status == KnownHostStatus::Match {
+                    let _ = prompt.reply.send(TrustDecision::AcceptOnce);
+                } else {
+                    self.enqueue_modal(PromptModal::HostKey { prompt, status });
+                }
+            }
+            PendingPrompt::Credential(prompt) => {
+                // Only a stored password/passphrase can be supplied silently;
+                // keyboard-interactive answers are never stored (§6).
+                let stored = match (&prompt.credential, &prompt.request) {
+                    (
+                        Some(cred),
+                        CredentialRequest::Password { .. } | CredentialRequest::Passphrase { .. },
+                    ) => credentials::load(cred).ok().flatten(),
+                    _ => None,
+                };
+                match stored {
+                    Some(value) => {
+                        let _ = prompt.reply.send(CredentialReply::Secret {
+                            value,
+                            remember: false,
+                        });
+                    }
+                    None => self.enqueue_modal(PromptModal::credential(prompt)),
+                }
+            }
+        }
+    }
+
+    fn enqueue_modal(&mut self, modal: PromptModal) {
+        if self.modal.is_none() {
+            self.modal = Some(modal);
+        } else {
+            self.modal_queue.push_back(modal);
+        }
+    }
+
+    /// Apply the user's answer to a modal: record trust or a remembered secret,
+    /// then send the reply back to the waiting backend over its oneshot (§6).
+    fn resolve_modal(&mut self, modal: PromptModal, answer: ModalAnswer) {
+        match (modal, answer) {
+            (PromptModal::HostKey { prompt, .. }, ModalAnswer::Trust(decision)) => {
+                if decision == TrustDecision::AcceptAndRemember
+                    && let Some(store) = &self.store
+                {
+                    let _ = store.remember_host_key(
+                        &prompt.host,
+                        prompt.port,
+                        &prompt.key_type,
+                        &prompt.public_key,
+                    );
+                }
+                let _ = prompt.reply.send(decision);
+            }
+            (PromptModal::Credential { prompt, .. }, ModalAnswer::CredentialCancelled) => {
+                let _ = prompt.reply.send(CredentialReply::Cancelled);
+            }
+            (
+                PromptModal::Credential { prompt, .. },
+                ModalAnswer::CredentialSecret { value, remember },
+            ) => {
+                let secret = Secret::new(value);
+                if remember && let Some(cred) = &prompt.credential {
+                    let _ = credentials::store(cred, &secret);
+                }
+                let _ = prompt.reply.send(CredentialReply::Secret {
+                    value: secret,
+                    remember,
+                });
+            }
+            (PromptModal::Credential { prompt, .. }, ModalAnswer::CredentialResponses(values)) => {
+                let secrets = values.into_iter().map(Secret::new).collect();
+                let _ = prompt.reply.send(CredentialReply::Responses(secrets));
+            }
+            // A Pending answer never reaches here, and the variants always match.
+            _ => {}
         }
     }
 
@@ -891,13 +997,18 @@ impl eframe::App for TerminalApp {
         let ctx = ui.ctx().clone();
 
         // Keep every pane live — including background tabs (§10.1) — by draining
-        // its transport and feeding its terminal.
+        // its transport and feeding its terminal, collecting any prompts a
+        // backend raised for the app to answer (§6).
         let mut fed = 0usize;
+        let mut prompts = Vec::new();
         for live in self.live.values_mut() {
-            fed += live.pump();
+            fed += live.pump(&mut prompts);
         }
         if let Some(perf) = self.perf.as_mut() {
             perf.bytes += fed;
+        }
+        for prompt in prompts {
+            self.handle_prompt(prompt);
         }
 
         // Keyboard/paste to the focused recipient set, before drawing so the
@@ -946,6 +1057,18 @@ impl eframe::App for TerminalApp {
                 EditorOutcome::Open => self.editor = Some(editor),
                 EditorOutcome::Cancel => {}
                 EditorOutcome::Save(spec) => self.save_session(*spec),
+            }
+        }
+
+        // A backend prompt (host key, credential) takes the foreground until
+        // answered (FR-23, §6); further prompts wait in the queue.
+        if self.modal.is_none() {
+            self.modal = self.modal_queue.pop_front();
+        }
+        if let Some(mut modal) = self.modal.take() {
+            match modal.show(&ctx) {
+                ModalAnswer::Pending => self.modal = Some(modal),
+                answer => self.resolve_modal(modal, answer),
             }
         }
     }
