@@ -103,9 +103,15 @@ async fn run(cfg: SshConfig, backend: TransportBackendEnd) {
                 let reason =
                     run_connected(chain, &mut input, &mut control, &output, &events, &mut size)
                         .await;
-                let user_ended = reason == DisconnectReason::Local;
+                // Reconnect only an unexpected drop (FR-29). A clean logout
+                // (`Remote`) or a user disconnect (`Local`) ends the session —
+                // logging back in on a logout is exactly what must not happen.
+                let reconnect = matches!(
+                    reason,
+                    DisconnectReason::Timeout | DisconnectReason::Failed(_)
+                );
                 let _ = events.send(TransportEvent::Disconnected { reason }).await;
-                if user_ended {
+                if !reconnect {
                     return;
                 }
             }
@@ -541,6 +547,10 @@ async fn pump(
     output: &mpsc::Sender<Bytes>,
     size: &mut (u32, u32),
 ) -> DisconnectReason {
+    // Whether the remote shell reported its exit before the channel closed.
+    // That distinguishes a clean logout (do not reconnect) from a link that
+    // dropped out from under us (reconnect — FR-29).
+    let mut exited = false;
     loop {
         tokio::select! {
             chunk = input.recv() => match chunk {
@@ -573,10 +583,19 @@ async fn pump(
                 Some(ChannelMsg::ExtendedData { data, .. }) => {
                     let _ = output.send(Bytes::copy_from_slice(&data)).await;
                 }
-                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
-                    return DisconnectReason::Remote;
+                // The shell exited: a clean logout. Note it and wait for close.
+                Some(ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. }) => {
+                    exited = true;
                 }
-                // Exit status arrives before the close; keep going until close.
+                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
+                    // A clean logout is `Remote` (do not reconnect); a channel
+                    // that vanished without an exit is a dropped link (FR-29).
+                    return if exited {
+                        DisconnectReason::Remote
+                    } else {
+                        DisconnectReason::Timeout
+                    };
+                }
                 Some(_) => {}
             },
         }

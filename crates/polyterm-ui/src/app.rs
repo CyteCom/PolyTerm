@@ -35,6 +35,7 @@
 //! this thread ever blocks on the runtime.
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -181,6 +182,10 @@ pub struct TerminalApp {
     /// waiting behind it (a second session connecting at once).
     modal: Option<PromptModal>,
     modal_queue: VecDeque<PromptModal>,
+    /// Key passphrases entered this run, kept in memory (zeroised on drop) and
+    /// reused for any session that uses the same key, so a key is unlocked once.
+    /// Never persisted — it is not the keyring.
+    passphrase_cache: HashMap<PathBuf, Secret<String>>,
     /// Whether the session panel is shown. Forced on while nothing is open.
     show_panel: bool,
     /// Whether to restore the tile layout on startup (FR-4 opt-in). Persisted.
@@ -306,6 +311,7 @@ impl TerminalApp {
             editor: None,
             modal: None,
             modal_queue: VecDeque::new(),
+            passphrase_cache: HashMap::new(),
             show_panel: true,
             restore_enabled,
             last_error: None,
@@ -528,6 +534,18 @@ impl TerminalApp {
                 }
             }
             PendingPrompt::Credential(prompt) => {
+                // A key passphrase already unlocked this run is supplied from the
+                // in-memory cache with no prompt (requirement: unlock a key once).
+                if let CredentialRequest::Passphrase { key_path } = &prompt.request
+                    && let Some(cached) = self.passphrase_cache.get(key_path)
+                {
+                    let value = Secret::new(cached.expose().to_owned());
+                    let _ = prompt.reply.send(CredentialReply::Secret {
+                        value,
+                        remember: false,
+                    });
+                    return;
+                }
                 // Only a stored password/passphrase can be supplied silently;
                 // keyboard-interactive answers are never stored (§6).
                 let stored = match (&prompt.credential, &prompt.request) {
@@ -583,6 +601,12 @@ impl TerminalApp {
                 ModalAnswer::CredentialSecret { value, remember },
             ) => {
                 let secret = Secret::new(value);
+                // Cache a key passphrase in memory so the key stays unlocked for
+                // the rest of the run (requirement), independent of "remember".
+                if let CredentialRequest::Passphrase { key_path } = &prompt.request {
+                    self.passphrase_cache
+                        .insert(key_path.clone(), Secret::new(secret.expose().to_owned()));
+                }
                 if remember && let Some(cred) = &prompt.credential {
                     let _ = credentials::store(cred, &secret);
                 }
