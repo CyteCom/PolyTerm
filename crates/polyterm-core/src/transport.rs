@@ -134,6 +134,25 @@ pub enum SerialSignal {
     Rts,
 }
 
+/// The state of the RS-232 modem *input* lines (FR-48).
+///
+/// The counterpart to [`SerialSignal`], which drives the output lines: this
+/// carries the input line states up to the UI, reported via
+/// [`TransportEvent::ModemStatus`]. Serial-specific, like `SerialSignal`, and
+/// like it kept here so the UI can display it without depending on the serial
+/// backend (ADR-11). Every field is `false` (line low) by default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ModemLines {
+    /// Clear To Send.
+    pub cts: bool,
+    /// Data Set Ready.
+    pub dsr: bool,
+    /// Data Carrier Detect.
+    pub dcd: bool,
+    /// Ring Indicator.
+    pub ri: bool,
+}
+
 /// Out-of-band control. A backend ignores what does not apply to it; that is
 /// the design, not a gap. `Resize` being a no-op on serial is correct and must
 /// not be "fixed" (ADR-5).
@@ -177,6 +196,10 @@ pub enum TransportEvent {
     Authenticated,
     /// The session is usable. `output` carries bytes from here on.
     Connected,
+    /// Serial modem input line states changed (FR-48). Emitted only by the
+    /// serial backend, and only when a line changes, so it stays sparse on the
+    /// bounded events channel. Other backends never emit it.
+    ModemStatus(ModemLines),
     /// The link is down. The handle remains valid: a backend with a reconnect
     /// policy, or one waiting for an unplugged device to return (FR-49), will
     /// follow this with [`Connecting`]. Otherwise the session stays down until

@@ -15,7 +15,7 @@ use std::time::Instant;
 
 use bytes::Bytes;
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Sense, Vec2};
-use polyterm_core::{ControlMsg, TransportEvent, TransportHandle};
+use polyterm_core::{ControlMsg, ModemLines, TransportEvent, TransportHandle};
 use polyterm_term::{
     CursorShape, GridSize, MouseEncoding, MouseProtocol, MouseReport, Snapshot, TermEvent, Terminal,
 };
@@ -67,6 +67,9 @@ pub struct TerminalApp {
     font_size: f32,
     /// The running session log, if any (FR-50). `Some` while logging.
     log: Option<SessionLog>,
+    /// Latest serial modem input line states, if the backend reports them
+    /// (FR-48). `None` for non-serial sessions and while disconnected.
+    modem: Option<ModemLines>,
 
     /// Keystrokes and pastes toward the far end.
     input: mpsc::Sender<Bytes>,
@@ -197,6 +200,7 @@ impl TerminalApp {
             theme: Theme::default(),
             font_size: 15.0,
             log: None,
+            modem: None,
             input,
             control,
             output: ui_output_rx,
@@ -216,8 +220,13 @@ impl TerminalApp {
     fn pump_events(&mut self) {
         while let Ok(event) = self.events.try_recv() {
             match event {
-                TransportEvent::Disconnected { .. } => self.disconnected = true,
+                TransportEvent::Disconnected { .. } => {
+                    self.disconnected = true;
+                    // The lines are meaningless with no link; hide them.
+                    self.modem = None;
+                }
                 TransportEvent::Connected => self.disconnected = false,
+                TransportEvent::ModemStatus(lines) => self.modem = Some(lines),
                 // Connecting / Authenticated / prompts: nothing for a local
                 // shell in M2.
                 _ => {}
@@ -535,12 +544,49 @@ impl eframe::App for TerminalApp {
             perf.record_paint(start.elapsed().as_secs_f32() * 1000.0);
         }
 
+        self.modem_readout(ui, avail, cell_h);
         self.log_indicator(ui, avail, cell_h);
         self.perf_overlay(ui, avail, cell_h);
     }
 }
 
 impl TerminalApp {
+    /// Show the serial modem input lines top-left, lit when high (FR-48).
+    fn modem_readout(&self, ui: &egui::Ui, avail: Rect, cell_h: f32) {
+        let Some(m) = self.modem else {
+            return;
+        };
+        let font = FontId::monospace((cell_h * 0.8).max(10.0));
+        let high = Color32::from_rgb(0x66, 0xff, 0x66);
+        let low = Color32::from_rgb(0x55, 0x55, 0x55);
+        let painter = ui.painter();
+
+        let items = [("CTS", m.cts), ("DSR", m.dsr), ("DCD", m.dcd), ("RI", m.ri)];
+        let galleys: Vec<_> = items
+            .iter()
+            .map(|(label, on)| {
+                let color = if *on { high } else { low };
+                painter.layout_no_wrap(format!("{label} "), font.clone(), color)
+            })
+            .collect();
+
+        let total_w: f32 = galleys.iter().map(|g| g.size().x).sum();
+        let height = galleys.first().map(|g| g.size().y).unwrap_or(0.0);
+        let origin = Pos2::new(avail.left() + 8.0, avail.top() + 4.0);
+        let bg = Rect::from_min_size(
+            origin - Vec2::splat(3.0),
+            Vec2::new(total_w + 6.0, height + 6.0),
+        );
+        painter.rect_filled(bg, 2.0, Color32::from_black_alpha(190));
+
+        let mut x = origin.x;
+        for galley in galleys {
+            let w = galley.size().x;
+            painter.galley(Pos2::new(x, origin.y), galley, Color32::WHITE);
+            x += w;
+        }
+    }
+
     /// Start or stop session logging (FR-50). With no file dialog yet, logging
     /// goes to an auto-named file; the on-screen indicator shows where.
     fn toggle_logging(&mut self) {

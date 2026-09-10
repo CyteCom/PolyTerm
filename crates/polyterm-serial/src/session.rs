@@ -24,8 +24,9 @@ use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use polyterm_core::{
-    ControlMsg, DisconnectReason, FlowControl, Parity, SerialConfig, SerialSignal, StopBits,
-    Transport, TransportBackendEnd, TransportError, TransportEvent, TransportHandle, TransportKind,
+    ControlMsg, DisconnectReason, FlowControl, ModemLines, Parity, SerialConfig, SerialSignal,
+    StopBits, Transport, TransportBackendEnd, TransportError, TransportEvent, TransportHandle,
+    TransportKind,
 };
 use serialport::SerialPort;
 use tokio::runtime::Handle;
@@ -41,6 +42,11 @@ const READ_TIMEOUT: Duration = Duration::from_millis(20);
 const BREAK_DURATION: Duration = Duration::from_millis(250);
 
 const READ_CHUNK: usize = 4096;
+
+/// How often the modem input lines are polled (FR-48). serialport has no
+/// change interrupt, so this is a poll; changes are reported, unchanged states
+/// are not. Five times a second is plenty for lines a human reads.
+const MODEM_POLL_INTERVAL: Duration = Duration::from_millis(200);
 
 /// A serial backend. One value opens every serial session for the life of the
 /// process; constructing it does no I/O.
@@ -98,6 +104,9 @@ fn run(mut port: Box<dyn SerialPort>, cfg: SerialConfig, backend: TransportBacke
     let _ = events.blocking_send(TransportEvent::Connected);
     let mut buf = [0u8; READ_CHUNK];
     let mut break_until: Option<Instant> = None;
+    // Poll the modem lines immediately, then on the interval.
+    let mut modem_deadline = Instant::now();
+    let mut last_modem: Option<ModemLines> = None;
 
     loop {
         // 1. Control (out-of-band). Drain everything pending.
@@ -133,6 +142,17 @@ fn run(mut port: Box<dyn SerialPort>, cfg: SerialConfig, backend: TransportBacke
         {
             let _ = port.clear_break();
             break_until = None;
+        }
+
+        // Poll the modem input lines and report changes (FR-48).
+        if Instant::now() >= modem_deadline {
+            modem_deadline = Instant::now() + MODEM_POLL_INTERVAL;
+            if let Some(lines) = read_modem(&mut port)
+                && last_modem != Some(lines)
+            {
+                last_modem = Some(lines);
+                let _ = events.blocking_send(TransportEvent::ModemStatus(lines));
+            }
         }
 
         // 2. Input → the line. Drain everything pending.
@@ -172,6 +192,9 @@ fn run(mut port: Box<dyn SerialPort>, cfg: SerialConfig, backend: TransportBacke
                     Some(reopened) => {
                         port = reopened;
                         break_until = None;
+                        // Re-poll the modem lines on the fresh port from scratch.
+                        last_modem = None;
+                        modem_deadline = Instant::now();
                         let _ = events.blocking_send(TransportEvent::Connected);
                     }
                     None => return,
@@ -199,6 +222,17 @@ fn wait_and_reopen(
             Some(_) => continue,
         }
     }
+}
+
+/// Read the four modem input lines. `None` if any read errors — the caller
+/// keeps the last known state rather than reporting a spurious change.
+fn read_modem(port: &mut Box<dyn SerialPort>) -> Option<ModemLines> {
+    Some(ModemLines {
+        cts: port.read_clear_to_send().ok()?,
+        dsr: port.read_data_set_ready().ok()?,
+        dcd: port.read_carrier_detect().ok()?,
+        ri: port.read_ring_indicator().ok()?,
+    })
 }
 
 fn map_data_bits(bits: u8) -> serialport::DataBits {

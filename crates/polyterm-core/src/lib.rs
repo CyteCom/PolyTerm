@@ -39,6 +39,6 @@ pub use session::{
 };
 pub use transport::{
     CONTROL_CHANNEL_CAPACITY, ControlMsg, DisconnectReason, EVENT_CHANNEL_CAPACITY,
-    INPUT_CHANNEL_CAPACITY, OUTPUT_CHANNEL_CAPACITY, SerialSignal, Transport, TransportBackendEnd,
-    TransportEvent, TransportHandle, TransportKind,
+    INPUT_CHANNEL_CAPACITY, ModemLines, OUTPUT_CHANNEL_CAPACITY, SerialSignal, Transport,
+    TransportBackendEnd, TransportEvent, TransportHandle, TransportKind,
 };
