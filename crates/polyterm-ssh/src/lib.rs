@@ -16,8 +16,9 @@
 //! What is here: password, public-key (including encrypted keys, via a
 //! passphrase prompt), keyboard-interactive, and agent authentication — the
 //! agent being the Unix socket on Linux and the OpenSSH named pipe or Pageant
-//! on Windows (FR-22). Jump hosts (FR-28) and automatic reconnect (FR-29) are
-//! follow-ups; the shape below is what they build on.
+//! on Windows (FR-22); and jump-host chaining, each hop verified and
+//! authenticated in its own right, tunnelled through the previous (FR-28).
+//! Automatic reconnect (FR-29) is the remaining follow-up.
 
 #![forbid(unsafe_code)]
 
@@ -78,38 +79,137 @@ async fn run(cfg: SshConfig, backend: TransportBackendEnd) {
         keepalive_interval: cfg.keepalive,
         ..Default::default()
     });
-    let handler = HostKeyHandler {
-        events: events.clone(),
-        host: cfg.host.clone(),
-        port: cfg.port,
+
+    // Connect through any jump hosts to the target, authenticating every hop
+    // (FR-28). `establish` reports its own failures, so `None` means stop. The
+    // whole chain is kept alive: each session tunnels through the one before it,
+    // so dropping an earlier hop would collapse the tunnel to the target.
+    let chain = match establish(&cfg, config, &events).await {
+        Some(chain) => chain,
+        None => return,
     };
+    let _ = events.send(TransportEvent::Authenticated).await;
 
-    let mut session = match client::connect(config, (cfg.host.as_str(), cfg.port), handler).await {
-        Ok(session) => session,
-        Err(e) => return fail(&events, format!("connection failed: {e}")).await,
+    let reason = {
+        let Some(target) = chain.last() else {
+            return fail(&events, "no session was established".to_owned()).await;
+        };
+        let channel = match open_shell(target).await {
+            Ok(channel) => channel,
+            Err(e) => return fail(&events, format!("could not open shell: {e}")).await,
+        };
+        let _ = events.send(TransportEvent::Connected).await;
+
+        let reason = pump(channel, &mut input, &mut control, &output).await;
+        let _ = target.disconnect(Disconnect::ByApplication, "", "en").await;
+        reason
     };
-
-    match authenticate(&mut session, &cfg, &events).await {
-        Ok(true) => {
-            let _ = events.send(TransportEvent::Authenticated).await;
-        }
-        Ok(false) => return fail(&events, "authentication failed".to_owned()).await,
-        Err(e) => return fail(&events, format!("authentication error: {e}")).await,
-    }
-
-    let channel = match open_shell(&session).await {
-        Ok(channel) => channel,
-        Err(e) => return fail(&events, format!("could not open shell: {e}")).await,
-    };
-    let _ = events.send(TransportEvent::Connected).await;
-
-    let reason = pump(channel, &mut input, &mut control, &output).await;
-    let _ = session
-        .disconnect(Disconnect::ByApplication, "", "en")
-        .await;
     let _ = events.send(TransportEvent::Disconnected { reason }).await;
-    // Dropping `events` now closes the handle, which is how the UI learns the
-    // session is finished.
+    // Dropping `chain` (and `events`) here closes the jump sessions and the
+    // handle, which is how the UI learns the session is finished.
+}
+
+/// One hop toward the target: a jump host, or the target itself.
+struct Hop<'a> {
+    host: &'a str,
+    port: u16,
+    user: &'a str,
+    auth: &'a SshAuth,
+}
+
+/// Connect through the jump chain and authenticate each hop, returning the
+/// sessions in order (jumps first, the target last), or `None` on any failure
+/// having reported it (FR-28). Every session in the returned chain must stay
+/// alive: each tunnels a `direct-tcpip` channel through the previous.
+async fn establish(
+    cfg: &SshConfig,
+    config: Arc<client::Config>,
+    events: &mpsc::Sender<TransportEvent>,
+) -> Option<Vec<client::Handle<HostKeyHandler>>> {
+    let mut hops: Vec<Hop> = cfg
+        .jumps
+        .iter()
+        .map(|j| Hop {
+            host: &j.host,
+            port: j.port,
+            user: &j.username,
+            auth: &j.auth,
+        })
+        .collect();
+    hops.push(Hop {
+        host: &cfg.host,
+        port: cfg.port,
+        user: &cfg.username,
+        auth: &cfg.auth,
+    });
+
+    let mut chain: Vec<client::Handle<HostKeyHandler>> = Vec::new();
+    for hop in &hops {
+        // Each hop verifies its own host key against its own host/port.
+        let handler = HostKeyHandler {
+            events: events.clone(),
+            host: hop.host.to_owned(),
+            port: hop.port,
+        };
+        let mut next = match chain.last() {
+            // Tunnel through the previous hop with a direct-tcpip channel.
+            Some(prev) => {
+                let channel = match prev
+                    .channel_open_direct_tcpip(hop.host, u32::from(hop.port), "127.0.0.1", 0)
+                    .await
+                {
+                    Ok(channel) => channel,
+                    Err(e) => {
+                        fail(
+                            events,
+                            format!("could not tunnel to {}:{}: {e}", hop.host, hop.port),
+                        )
+                        .await;
+                        return None;
+                    }
+                };
+                match client::connect_stream(config.clone(), channel.into_stream(), handler).await {
+                    Ok(session) => session,
+                    Err(e) => {
+                        fail(
+                            events,
+                            format!(
+                                "connection to {}:{} via jump host failed: {e}",
+                                hop.host, hop.port
+                            ),
+                        )
+                        .await;
+                        return None;
+                    }
+                }
+            }
+            // The first hop is a direct TCP connection.
+            None => match client::connect(config.clone(), (hop.host, hop.port), handler).await {
+                Ok(session) => session,
+                Err(e) => {
+                    fail(
+                        events,
+                        format!("connection to {}:{} failed: {e}", hop.host, hop.port),
+                    )
+                    .await;
+                    return None;
+                }
+            },
+        };
+        match authenticate_with(&mut next, hop.user, hop.host, hop.auth, events).await {
+            Ok(true) => {}
+            Ok(false) => {
+                fail(events, format!("authentication to {} failed", hop.host)).await;
+                return None;
+            }
+            Err(e) => {
+                fail(events, format!("authentication error at {}: {e}", hop.host)).await;
+                return None;
+            }
+        }
+        chain.push(next);
+    }
+    Some(chain)
 }
 
 /// Report a fatal setup failure as a `Disconnected` and stop.
@@ -141,20 +241,24 @@ async fn open_shell(
     Ok(channel)
 }
 
-/// Authenticate per the session's configured method (FR-20, FR-21). Returns
+/// Authenticate one hop by its configured method (FR-20, FR-21, FR-22). Returns
 /// whether authentication succeeded; a cancelled prompt fails cleanly rather
-/// than retrying (`ARCHITECTURE.md` §6).
-async fn authenticate(
+/// than retrying (`ARCHITECTURE.md` §6). Taking the parts explicitly, rather
+/// than an `SshConfig`, is what lets a jump host authenticate the same way as
+/// the target (FR-28).
+async fn authenticate_with(
     session: &mut client::Handle<HostKeyHandler>,
-    cfg: &SshConfig,
+    username: &str,
+    host: &str,
+    auth: &SshAuth,
     events: &mpsc::Sender<TransportEvent>,
 ) -> Result<bool, russh::Error> {
-    let user = cfg.username.clone();
-    match &cfg.auth {
+    let user = username.to_owned();
+    match auth {
         SshAuth::Password { credential } => {
             let request = CredentialRequest::Password {
                 username: user.clone(),
-                host: cfg.host.clone(),
+                host: host.to_owned(),
             };
             match ask_credential(events, request, Some(credential.clone())).await {
                 CredentialReply::Secret { value, .. } => Ok(session
