@@ -11,6 +11,8 @@
 //! (`ARCHITECTURE.md` §6.1 frames the answerer as "the binary"; since ADR-15
 //! the UI holds the store and drains the events, so the answerer lives here.)
 
+use std::path::PathBuf;
+
 use egui::{Color32, TextEdit};
 use polyterm_core::{
     CredentialPrompt, CredentialRequest, HostKeyPrompt, KnownHostStatus, TrustDecision,
@@ -36,6 +38,15 @@ pub(crate) enum PromptModal {
         /// keyboard-interactive prompt).
         inputs: Vec<String>,
         remember: bool,
+        /// An error to show, e.g. after a wrong passphrase was rejected.
+        error: Option<String>,
+    },
+    /// Pre-unlocking a key at startup (FR): no backend awaits it — the entered
+    /// passphrase is verified and cached, nothing more.
+    UnlockKey {
+        path: PathBuf,
+        input: String,
+        error: Option<String>,
     },
 }
 
@@ -68,6 +79,44 @@ impl PromptModal {
             prompt,
             inputs: vec![String::new(); count],
             remember: false,
+            error: None,
+        }
+    }
+
+    /// A fresh credential modal for `prompt` showing `error` (e.g. a rejected
+    /// passphrase), so the same prompt — and its still-open reply — is retried.
+    pub(crate) fn credential_retry(prompt: CredentialPrompt, error: String) -> Self {
+        match Self::credential(prompt) {
+            Self::Credential {
+                prompt,
+                inputs,
+                remember,
+                ..
+            } => Self::Credential {
+                prompt,
+                inputs,
+                remember,
+                error: Some(error),
+            },
+            other => other,
+        }
+    }
+
+    /// A startup unlock modal for `path`.
+    pub(crate) fn unlock_key(path: PathBuf) -> Self {
+        Self::UnlockKey {
+            path,
+            input: String::new(),
+            error: None,
+        }
+    }
+
+    /// A startup unlock modal for `path` showing `error` (a rejected passphrase).
+    pub(crate) fn unlock_key_retry(path: PathBuf, error: String) -> Self {
+        Self::UnlockKey {
+            path,
+            input: String::new(),
+            error: Some(error),
         }
     }
 
@@ -78,9 +127,35 @@ impl PromptModal {
                 prompt,
                 inputs,
                 remember,
-            } => show_credential(prompt, inputs, remember, ctx),
+                error,
+            } => show_credential(prompt, inputs, remember, error.as_deref(), ctx),
+            PromptModal::UnlockKey { path, input, error } => {
+                show_unlock_key(path, input, error.as_deref(), ctx)
+            }
         }
     }
+}
+
+fn show_unlock_key(
+    path: &std::path::Path,
+    input: &mut String,
+    error: Option<&str>,
+    ctx: &egui::Context,
+) -> ModalAnswer {
+    let mut answer = ModalAnswer::Pending;
+    let mut open = true;
+    window("Unlock SSH key").open(&mut open).show(ctx, |ui| {
+        if let Some(error) = error {
+            ui.colored_label(WARN, error);
+        }
+        ui.label(format!("Passphrase for {}", path.display()));
+        secret_field(ui, input);
+        answer = secret_buttons_labelled(ui, input, false, "Unlock", "Skip");
+    });
+    if !open {
+        return ModalAnswer::CredentialCancelled;
+    }
+    answer
 }
 
 fn window(title: &str) -> egui::Window<'_> {
@@ -150,11 +225,15 @@ fn show_credential(
     prompt: &CredentialPrompt,
     inputs: &mut [String],
     remember: &mut bool,
+    error: Option<&str>,
     ctx: &egui::Context,
 ) -> ModalAnswer {
     let mut answer = ModalAnswer::Pending;
     let mut open = true;
     window("Authentication").open(&mut open).show(ctx, |ui| {
+        if let Some(error) = error {
+            ui.colored_label(WARN, error);
+        }
         match &prompt.request {
             CredentialRequest::Password { username, host } => {
                 ui.label(format!("Password for {username}@{host}"));
@@ -212,17 +291,27 @@ fn secret_field(ui: &mut egui::Ui, value: &mut String) {
 }
 
 fn secret_buttons(ui: &mut egui::Ui, value: &str, remember: bool) -> ModalAnswer {
+    secret_buttons_labelled(ui, value, remember, "OK", "Cancel")
+}
+
+fn secret_buttons_labelled(
+    ui: &mut egui::Ui,
+    value: &str,
+    remember: bool,
+    ok: &str,
+    cancel: &str,
+) -> ModalAnswer {
     let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
     let mut answer = ModalAnswer::Pending;
     ui.separator();
     ui.horizontal(|ui| {
-        if ui.button("OK").clicked() || enter {
+        if ui.button(ok).clicked() || enter {
             answer = ModalAnswer::CredentialSecret {
                 value: value.to_owned(),
                 remember,
             };
         }
-        if ui.button("Cancel").clicked() {
+        if ui.button(cancel).clicked() {
             answer = ModalAnswer::CredentialCancelled;
         }
     });

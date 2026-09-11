@@ -20,6 +20,8 @@ tracing = { workspace = true }
 jiff = { workspace = true }
 # Persisting the tile layout (FR-95) through eframe's storage.
 serde = { workspace = true }
+# Verifying an SSH key passphrase before caching it (ADR-17). Pure Rust.
+ssh-key = { workspace = true }
 
 [dev-dependencies]
 # Round-trip test for the persisted layout.

@@ -441,3 +441,37 @@ that links it — the binary) pulls `ring` in.
 or `russh` gains a pure-Rust backend. Either would let us drop the C build dependency
 without touching anything above `polyterm-ssh`, which is why the `Transport` boundary and
 `SessionSpawner` (ADR-15) keep this contained.
+
+---
+
+## ADR-17 · Accepted · `ssh-key` in the UI to verify key passphrases
+
+**Decision.** `polyterm-ui` depends on `ssh-key` (pure Rust) to decrypt an
+encrypted OpenSSH private key and so verify a passphrase *before* it is cached
+or used for a startup unlock.
+
+**Why.** A key passphrase, once entered, is cached in memory and reused for
+every session using that key (and pre-unlocked at launch for configured keys).
+Caching an unverified passphrase is a trap: a single typo would be replayed to
+every later session and silently fail, with no re-prompt, until the app
+restarts. Verification needs to load the key. The SSH backend can, but the UI
+is the answerer (it holds the cache and shows the prompt), and it must not
+depend on `polyterm-ssh` (ADR-11). `ssh-key` is the key-format crate `russh`
+already pulls in; it is pure Rust (its decryption uses RustCrypto's `aes`,
+`chacha20poly1305`, and `bcrypt-pbkdf`, not `ring`), so it adds no C dependency
+to the UI — only `polyterm-ssh` carries that, via `russh` (ADR-16).
+
+**Rejected.**
+
+- **A retry protocol between backend and UI** — on a wrong passphrase the
+  backend re-prompts and the UI drops the bad cache entry. Keeps SSH-key
+  knowledge out of the UI, but it is a heuristic (detecting the retry), it only
+  self-corrects on the next connection attempt, and it complicates the prompt
+  contract. Verifying up front is simpler and correct immediately.
+- **Caching unverified** — the trap above; rejected on correctness.
+- **A verify helper in `polyterm-core`** — core is types and traits with no
+  I/O (its own rule); reading and decrypting a key file does not belong there.
+
+**Consequence.** The UI now understands the OpenSSH private-key format enough to
+decrypt one. Pinned to `=0.7.0-rc.11`, the exact version `russh` resolves, so
+the tree holds a single copy.

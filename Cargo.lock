@@ -3609,6 +3609,7 @@ dependencies = [
  "polyterm-term",
  "serde",
  "serde_json",
+ "ssh-key",
  "tokio",
  "tracing",
 ]

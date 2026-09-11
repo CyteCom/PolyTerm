@@ -74,6 +74,10 @@ ironrdp-client = "0.1"        # (unused until M8)
 
 # --- storage & config --------------------------------------------------------
 rusqlite     = { version = "0.40", features = ["bundled"] }  # (unused until M4)
+# Pure-Rust OpenSSH key parsing, used by polyterm-ui to verify a key passphrase
+# before caching it (ADR-17). Pinned to the exact version russh resolves so the
+# tree holds one copy; `encryption` + `crypto` cover decrypting every key type.
+ssh-key      = { version = "=0.7.0-rc.11", features = ["encryption", "crypto"] }
 keyring      = "4"
 keyring-core = "1"            # (unused until M4)
 directories  = "6"            # (unused until M4)

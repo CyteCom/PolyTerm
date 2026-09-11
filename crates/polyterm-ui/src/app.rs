@@ -49,6 +49,7 @@ use polyterm_store::{SessionStore, credentials};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
+use crate::keys;
 use crate::palette::Theme;
 use crate::pane::{LivePane, encode_key};
 use crate::prompts::{ModalAnswer, PendingPrompt, PromptModal};
@@ -60,6 +61,8 @@ use crate::sessions::{
 const LAYOUT_KEY: &str = "polyterm_layout";
 /// Storage key for the restore-on-startup opt-in (FR-4).
 const RESTORE_KEY: &str = "polyterm_restore_enabled";
+/// Storage key for the SSH keys to unlock at startup.
+const STARTUP_KEYS_KEY: &str = "polyterm_startup_keys";
 
 /// How to reopen a pane on restart (FR-95). A pane's tree key is a throwaway
 /// instance id; this is the durable part — enough to bring the session back.
@@ -119,6 +122,8 @@ enum PanelAction {
     MoveSession(SessionId, FolderPath),
     NewFolder(FolderPath),
     DeleteFolder(FolderPath),
+    AddStartupKey(PathBuf),
+    RemoveStartupKey(PathBuf),
 }
 
 /// Which way to split a tile: `Right` puts the new pane beside the current one
@@ -186,6 +191,9 @@ pub struct TerminalApp {
     /// reused for any session that uses the same key, so a key is unlocked once.
     /// Never persisted — it is not the keyring.
     passphrase_cache: HashMap<PathBuf, Secret<String>>,
+    /// SSH keys to unlock at startup (persisted), and the draft path being added.
+    startup_keys: Vec<PathBuf>,
+    new_key_path: String,
     /// Whether the session panel is shown. Forced on while nothing is open.
     show_panel: bool,
     /// Whether to restore the tile layout on startup (FR-4 opt-in). Persisted.
@@ -294,6 +302,9 @@ impl TerminalApp {
         let restore_enabled = storage
             .and_then(|s| eframe::get_value::<bool>(s, RESTORE_KEY))
             .unwrap_or(false);
+        let startup_keys: Vec<PathBuf> = storage
+            .and_then(|s| eframe::get_value(s, STARTUP_KEYS_KEY))
+            .unwrap_or_default();
 
         let mut app = Self {
             tree: Tree::empty(egui::Id::new("polyterm_tiles")),
@@ -312,6 +323,8 @@ impl TerminalApp {
             modal: None,
             modal_queue: VecDeque::new(),
             passphrase_cache: HashMap::new(),
+            startup_keys,
+            new_key_path: String::new(),
             show_panel: true,
             restore_enabled,
             last_error: None,
@@ -329,6 +342,14 @@ impl TerminalApp {
                 .is_some_and(|layout| app.restore(ctx, layout));
         if !restored {
             app.open_in_new_tab(ctx, PaneSource::Adhoc(Box::new(initial)));
+        }
+
+        // Pre-unlock the configured SSH keys at launch (requirement): prompt
+        // once for each encrypted one, verified and cached for the run.
+        for key in app.startup_keys.clone() {
+            if keys::is_encrypted(&key) {
+                app.enqueue_modal(PromptModal::unlock_key(key));
+            }
         }
         app
     }
@@ -538,6 +559,16 @@ impl TerminalApp {
             PanelAction::DeleteFolder(path) => {
                 self.store_op(move |store| store.delete_folder(&path));
             }
+            PanelAction::AddStartupKey(path) => {
+                if !self.startup_keys.contains(&path) {
+                    self.startup_keys.push(path.clone());
+                }
+                // Unlock it now too, so adding a key takes effect immediately.
+                if keys::is_encrypted(&path) {
+                    self.enqueue_modal(PromptModal::unlock_key(path));
+                }
+            }
+            PanelAction::RemoveStartupKey(path) => self.startup_keys.retain(|p| p != &path),
         }
     }
 
@@ -633,13 +664,27 @@ impl TerminalApp {
                 PromptModal::Credential { prompt, .. },
                 ModalAnswer::CredentialSecret { value, remember },
             ) => {
-                let secret = Secret::new(value);
-                // Cache a key passphrase in memory so the key stays unlocked for
-                // the rest of the run (requirement), independent of "remember".
-                if let CredentialRequest::Passphrase { key_path } = &prompt.request {
+                // A key passphrase is verified before it is trusted (ADR-17): a
+                // wrong one re-prompts rather than caching a value that would
+                // then fail — silently — on every later use of that key.
+                let passphrase_key = match &prompt.request {
+                    CredentialRequest::Passphrase { key_path } => Some(key_path.clone()),
+                    _ => None,
+                };
+                if let Some(key_path) = &passphrase_key {
+                    if !keys::passphrase_ok(key_path, &value) {
+                        self.enqueue_modal(PromptModal::credential_retry(
+                            prompt,
+                            "Wrong passphrase.".to_owned(),
+                        ));
+                        return;
+                    }
+                    // Verified: keep it unlocked in memory for the rest of the
+                    // run, independent of the keyring "remember" option (#1).
                     self.passphrase_cache
-                        .insert(key_path.clone(), Secret::new(secret.expose().to_owned()));
+                        .insert(key_path.clone(), Secret::new(value.clone()));
                 }
+                let secret = Secret::new(value);
                 if remember && let Some(cred) = &prompt.credential {
                     let _ = credentials::store(cred, &secret);
                 }
@@ -652,6 +697,19 @@ impl TerminalApp {
                 let secrets = values.into_iter().map(Secret::new).collect();
                 let _ = prompt.reply.send(CredentialReply::Responses(secrets));
             }
+            // Startup unlock: verify and cache, or re-prompt on a wrong pass.
+            (PromptModal::UnlockKey { path, .. }, ModalAnswer::CredentialSecret { value, .. }) => {
+                if keys::passphrase_ok(&path, &value) {
+                    self.passphrase_cache.insert(path, Secret::new(value));
+                } else {
+                    self.enqueue_modal(PromptModal::unlock_key_retry(
+                        path,
+                        "Wrong passphrase.".to_owned(),
+                    ));
+                }
+            }
+            // Skipping a startup key just leaves it locked.
+            (PromptModal::UnlockKey { .. }, ModalAnswer::CredentialCancelled) => {}
             // A Pending answer never reaches here, and the variants always match.
             _ => {}
         }
@@ -947,6 +1005,28 @@ impl TerminalApp {
         {
             actions.push(PanelAction::SetRestore(restore));
         }
+
+        ui.collapsing("SSH keys to unlock at startup", |ui| {
+            for key in &self.startup_keys {
+                ui.horizontal(|ui| {
+                    if ui.small_button("x").clicked() {
+                        actions.push(PanelAction::RemoveStartupKey(key.clone()));
+                    }
+                    ui.label(key.display().to_string());
+                });
+            }
+            ui.horizontal(|ui| {
+                ui.text_edit_singleline(&mut self.new_key_path);
+                if ui.button("Add key").clicked() {
+                    let trimmed = self.new_key_path.trim();
+                    if !trimmed.is_empty() {
+                        actions.push(PanelAction::AddStartupKey(PathBuf::from(trimmed)));
+                        self.new_key_path.clear();
+                    }
+                }
+            });
+        });
+
         ui.weak("Ctrl+Shift+E toggles this panel.");
         actions
     }
@@ -1175,6 +1255,7 @@ impl eframe::App for TerminalApp {
     /// be restored as enabled.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, RESTORE_KEY, &self.restore_enabled);
+        eframe::set_value(storage, STARTUP_KEYS_KEY, &self.startup_keys);
         let layout = PersistedLayout {
             tree: self.tree.clone(),
             sources: self.sources.iter().map(|(k, v)| (*k, v.clone())).collect(),

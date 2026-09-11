@@ -18,6 +18,7 @@
 #![forbid(unsafe_code)]
 
 mod app;
+mod keys;
 mod palette;
 mod pane;
 mod prompts;
