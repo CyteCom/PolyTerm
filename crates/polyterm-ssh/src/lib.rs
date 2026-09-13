@@ -583,13 +583,21 @@ async fn pump(
                 Some(ChannelMsg::ExtendedData { data, .. }) => {
                     let _ = output.send(Bytes::copy_from_slice(&data)).await;
                 }
-                // The shell exited: a clean logout. Note it and wait for close.
+                // The shell exited: note it. Do NOT stop here — the server sends
+                // exit-status, then EOF, then CLOSE, and it may reorder them.
                 Some(ChannelMsg::ExitStatus { .. } | ChannelMsg::ExitSignal { .. }) => {
                     exited = true;
                 }
-                Some(ChannelMsg::Eof | ChannelMsg::Close) | None => {
-                    // A clean logout is `Remote` (do not reconnect); a channel
-                    // that vanished without an exit is a dropped link (FR-29).
+                // EOF means the far end will send no more data; the channel is
+                // not closed yet (CLOSE still follows), so keep reading.
+                Some(ChannelMsg::Eof) => {}
+                // A server CHANNEL_CLOSE is a clean end — a logout. russh sends
+                // this only on a real close, so it is never a dropped link: do
+                // not reconnect (that is what was logging the user back in).
+                Some(ChannelMsg::Close) => return DisconnectReason::Remote,
+                // The channel vanished with no CLOSE: the link dropped. If the
+                // shell had already reported its exit, still treat it as clean.
+                None => {
                     return if exited {
                         DisconnectReason::Remote
                     } else {
