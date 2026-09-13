@@ -53,9 +53,7 @@ use crate::keys;
 use crate::palette::Theme;
 use crate::pane::{LivePane, encode_key};
 use crate::prompts::{ModalAnswer, PendingPrompt, PromptModal};
-use crate::sessions::{
-    EditorOutcome, FolderNode, SessionEditor, build_folder_tree, matches_query, parse_folder,
-};
+use crate::sessions::{EditorOutcome, FolderNode, SessionEditor, build_folder_tree, matches_query};
 
 /// Storage key for the persisted tile layout (FR-95).
 const LAYOUT_KEY: &str = "polyterm_layout";
@@ -114,8 +112,6 @@ pub trait SessionSpawner: Send + Sync {
 enum PanelAction {
     OpenLocalShell,
     OpenSaved(SessionId),
-    SetRestore(bool),
-    SetOpenShell(bool),
     /// Open the editor for a new session in this folder (FR-5).
     NewSession(FolderPath),
     /// Open the editor pre-filled from an existing session (FR-5).
@@ -123,21 +119,30 @@ enum PanelAction {
     DuplicateSession(SessionId),
     DeleteSession(SessionId),
     MoveSession(SessionId, FolderPath),
-    NewFolder(FolderPath),
-    DeleteFolder(FolderPath),
-    /// Include a session file as a new top-level folder, or create it if the
-    /// path does not exist yet (ADR-19).
-    AddSessionFile {
-        name: String,
-        path: PathBuf,
-    },
-    /// Stop including a top-level folder (leaves its file on disk).
-    RemoveTopFolder(String),
-    /// Open the file dialog to choose or name a session file.
-    BrowseSessionFile,
-    AddStartupKey(PathBuf),
-    RemoveStartupKey(PathBuf),
-    BrowseStartupKey,
+    /// Open the "add a folder" dialog from the tree root (ADR-19).
+    BeginAddFolder,
+    /// Open the delete-confirmation dialog for a folder.
+    BeginDeleteFolder(FolderTarget),
+    /// Open the settings dialog (startup options and SSH-key unlocking).
+    OpenSettings,
+}
+
+/// A folder targeted for deletion. A top-level folder is backed by a file, so
+/// deleting it un-includes that file (leaving it on disk); a subfolder is a
+/// path within a file, so deleting it removes the sessions beneath it.
+#[derive(Debug, Clone)]
+enum FolderTarget {
+    Top(String),
+    Sub(FolderPath),
+}
+
+/// The "add a folder" dialog: a name for the folder and the JSON file to back
+/// it (ADR-19). Fields are strings, parsed on confirm.
+#[derive(Debug, Default)]
+struct AddFolderDialog {
+    name: String,
+    path: String,
+    error: Option<String>,
 }
 
 /// Which way to split a tile: `Right` puts the new pane beside the current one
@@ -164,7 +169,7 @@ enum PickTarget {
     EditorKeyPath,
     /// The "add a startup key" field in the panel.
     StartupKey,
-    /// The "add a session file" path field in the panel (ADR-19).
+    /// The "add a folder" dialog's file-path field (ADR-19).
     SessionFile,
 }
 
@@ -208,13 +213,16 @@ pub struct TerminalApp {
     folders: Vec<FolderPath>,
     /// The session-tree filter text (FR-6).
     search: String,
-    /// Draft name for the "New folder" field.
-    new_folder_name: String,
-    /// Draft name and path for the "add a session file" fields (ADR-19).
-    new_top_name: String,
-    new_top_path: String,
     /// The open new/edit-session form, if any (FR-5).
     editor: Option<SessionEditor>,
+    /// The "add a folder" dialog (name + backing file), opened from the tree
+    /// root's right-click menu (ADR-19).
+    add_folder: Option<AddFolderDialog>,
+    /// A folder awaiting delete confirmation, from a folder's right-click menu.
+    confirm_delete: Option<FolderTarget>,
+    /// Whether the settings dialog (startup options and SSH-key unlocking) is
+    /// open. Moved off the panel so a long session list cannot bury it.
+    settings_open: bool,
     /// The prompt currently asking the user for an answer (FR-23, §6), and any
     /// waiting behind it (a second session connecting at once).
     modal: Option<PromptModal>,
@@ -361,10 +369,10 @@ impl TerminalApp {
             sessions,
             folders,
             search: String::new(),
-            new_folder_name: String::new(),
-            new_top_name: String::new(),
-            new_top_path: String::new(),
             editor: None,
+            add_folder: None,
+            confirm_delete: None,
+            settings_open: false,
             modal: None,
             modal_queue: VecDeque::new(),
             passphrase_cache: HashMap::new(),
@@ -581,8 +589,6 @@ impl TerminalApp {
                 self.open_in_new_tab(ctx, PaneSource::Adhoc(Box::new(local_shell_spec())))
             }
             PanelAction::OpenSaved(id) => self.open_in_new_tab(ctx, PaneSource::Saved(id)),
-            PanelAction::SetRestore(enabled) => self.restore_enabled = enabled,
-            PanelAction::SetOpenShell(enabled) => self.open_shell_on_startup = enabled,
             PanelAction::NewSession(folder) => {
                 // A session must live under some top-level folder; if none was
                 // chosen (the panel's "+ Session" button), default to the first
@@ -612,30 +618,207 @@ impl TerminalApp {
             PanelAction::MoveSession(id, folder) => {
                 self.store_op(move |store| store.move_session(id, &folder));
             }
-            PanelAction::NewFolder(path) => {
-                self.store_op(move |store| store.create_folder(&path));
-            }
-            PanelAction::DeleteFolder(path) => {
-                self.store_op(move |store| store.delete_folder(&path));
-            }
-            PanelAction::AddSessionFile { name, path } => {
-                self.store_op(move |store| store.add_file(name, path));
-            }
-            PanelAction::RemoveTopFolder(name) => {
-                self.store_op(move |store| store.remove_top_folder(&name));
-            }
-            PanelAction::BrowseSessionFile => self.begin_pick(ctx, PickTarget::SessionFile),
-            PanelAction::AddStartupKey(path) => {
-                if !self.startup_keys.contains(&path) {
-                    self.startup_keys.push(path.clone());
+            PanelAction::BeginAddFolder => self.add_folder = Some(AddFolderDialog::default()),
+            PanelAction::BeginDeleteFolder(target) => self.confirm_delete = Some(target),
+            PanelAction::OpenSettings => self.settings_open = true,
+        }
+    }
+
+    /// Add an SSH key to the startup-unlock set and, if it is encrypted, prompt
+    /// to unlock it now so the change takes effect immediately (FR-21).
+    fn add_startup_key(&mut self, path: PathBuf) {
+        if !self.startup_keys.contains(&path) {
+            self.startup_keys.push(path.clone());
+        }
+        if keys::is_encrypted(&path) {
+            self.enqueue_modal(PromptModal::unlock_key(path));
+        }
+    }
+
+    /// The "add a folder" dialog (ADR-19): name the folder and choose the JSON
+    /// file to back it. A new file is created if the path does not exist.
+    fn show_add_folder_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.add_folder.take() else {
+            return;
+        };
+        let mut open = true;
+        let (mut browse, mut submit, mut cancel) = (false, false, false);
+        egui::Window::new("Add folder")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                egui::Grid::new("add_folder_fields")
+                    .num_columns(2)
+                    .spacing([8.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("Name");
+                        ui.text_edit_singleline(&mut dialog.name);
+                        ui.end_row();
+                        ui.label("File");
+                        ui.horizontal(|ui| {
+                            ui.text_edit_singleline(&mut dialog.path);
+                            if ui
+                                .button("\u{1f4c1}")
+                                .on_hover_text("Choose or name a session file")
+                                .clicked()
+                            {
+                                browse = true;
+                            }
+                        });
+                        ui.end_row();
+                    });
+                ui.weak("Sessions in this folder are saved in the file. It is created if new.");
+                if let Some(err) = &dialog.error {
+                    ui.colored_label(Color32::from_rgb(0xff, 0x66, 0x66), err);
                 }
-                // Unlock it now too, so adding a key takes effect immediately.
-                if keys::is_encrypted(&path) {
-                    self.enqueue_modal(PromptModal::unlock_key(path));
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Add").clicked() {
+                        submit = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if !open || cancel {
+            return; // dropped: the dialog was already taken out
+        }
+        if browse {
+            self.begin_pick(ctx, PickTarget::SessionFile);
+        }
+        if submit {
+            let name = dialog.name.trim().to_owned();
+            let path = dialog.path.trim().to_owned();
+            if name.is_empty() || path.is_empty() {
+                dialog.error = Some("A name and a file are both required.".to_owned());
+            } else {
+                let result = match &mut self.sessions_lib {
+                    Some(lib) => lib.add_file(name, PathBuf::from(path)),
+                    None => Ok(()),
+                };
+                match result {
+                    Ok(()) => {
+                        self.reload();
+                        return; // success: the dialog closes
+                    }
+                    Err(e) => dialog.error = Some(e.to_string()),
                 }
             }
-            PanelAction::RemoveStartupKey(path) => self.startup_keys.retain(|p| p != &path),
-            PanelAction::BrowseStartupKey => self.begin_pick(ctx, PickTarget::StartupKey),
+        }
+        self.add_folder = Some(dialog);
+    }
+
+    /// The delete-confirmation dialog for a folder (ADR-19). A top-level folder
+    /// is un-included (its file stays on disk); a subfolder and its sessions are
+    /// removed.
+    fn show_confirm_delete_dialog(&mut self, ctx: &egui::Context) {
+        let Some(target) = self.confirm_delete.take() else {
+            return;
+        };
+        let message = match &target {
+            FolderTarget::Top(name) => format!(
+                "Remove the folder \u{201c}{name}\u{201d} from the tree?\n\nIts file is left \
+                 on disk; the sessions in it are not deleted."
+            ),
+            FolderTarget::Sub(path) => format!(
+                "Delete the folder \u{201c}{}\u{201d} and every session in it?",
+                path.segments().join("/")
+            ),
+        };
+        let mut open = true;
+        let (mut confirm, mut cancel) = (false, false);
+        egui::Window::new("Delete folder")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(message);
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Delete").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if !open || cancel {
+            return;
+        }
+        if confirm {
+            match target {
+                FolderTarget::Top(name) => self.store_op(move |s| s.remove_top_folder(&name)),
+                FolderTarget::Sub(path) => self.store_op(move |s| s.delete_folder(&path)),
+            }
+            return;
+        }
+        self.confirm_delete = Some(target);
+    }
+
+    /// The settings dialog: startup options and the SSH keys to unlock at launch
+    /// (FR-4, FR-21). Moved off the panel so a long session list cannot bury it.
+    fn show_settings_dialog(&mut self, ctx: &egui::Context) {
+        if !self.settings_open {
+            return;
+        }
+        let mut open = true;
+        let mut browse = false;
+        let mut add_key: Option<PathBuf> = None;
+        let mut remove_key: Option<PathBuf> = None;
+        egui::Window::new("Settings")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.checkbox(&mut self.restore_enabled, "Restore layout on startup");
+                ui.checkbox(
+                    &mut self.open_shell_on_startup,
+                    "Open a local shell on startup",
+                );
+                ui.separator();
+                ui.strong("SSH keys to unlock at startup");
+                for key in &self.startup_keys {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("x").clicked() {
+                            remove_key = Some(key.clone());
+                        }
+                        ui.label(key.display().to_string());
+                    });
+                }
+                ui.horizontal(|ui| {
+                    ui.text_edit_singleline(&mut self.new_key_path);
+                    if ui
+                        .button("\u{1f4c1}")
+                        .on_hover_text("Choose a key file")
+                        .clicked()
+                    {
+                        browse = true;
+                    }
+                    if ui.button("Add key").clicked() && !self.new_key_path.trim().is_empty() {
+                        add_key = Some(PathBuf::from(self.new_key_path.trim()));
+                    }
+                });
+                ui.separator();
+                ui.weak("Ctrl+Shift+E toggles the session panel.");
+            });
+
+        if !open {
+            self.settings_open = false;
+        }
+        if browse {
+            self.begin_pick(ctx, PickTarget::StartupKey);
+        }
+        if let Some(path) = remove_key {
+            self.startup_keys.retain(|p| p != &path);
+        }
+        if let Some(path) = add_key {
+            self.new_key_path.clear();
+            self.add_startup_key(path);
         }
     }
 
@@ -820,14 +1003,16 @@ impl TerminalApp {
                             }
                             PickTarget::StartupKey => self.new_key_path = text,
                             PickTarget::SessionFile => {
-                                // Default the folder name to the file's stem if
-                                // the user has not typed one yet.
-                                if self.new_top_name.trim().is_empty()
-                                    && let Some(stem) = path.file_stem()
-                                {
-                                    self.new_top_name = stem.to_string_lossy().into_owned();
+                                if let Some(dialog) = &mut self.add_folder {
+                                    // Default the folder name to the file's stem
+                                    // if the user has not typed one yet.
+                                    if dialog.name.trim().is_empty()
+                                        && let Some(stem) = path.file_stem()
+                                    {
+                                        dialog.name = stem.to_string_lossy().into_owned();
+                                    }
+                                    dialog.path = text;
                                 }
-                                self.new_top_path = text;
                             }
                         }
                     }
@@ -1058,7 +1243,16 @@ impl TerminalApp {
     fn session_panel(&mut self, ui: &mut egui::Ui) -> Vec<PanelAction> {
         let mut actions = Vec::new();
         ui.add_space(4.0);
-        ui.heading("Sessions");
+        ui.horizontal(|ui| {
+            ui.heading("Sessions");
+            // A gear on the right opens settings and SSH-key management, keeping
+            // them off the panel so a long session list cannot bury them.
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.button("\u{2699}").on_hover_text("Settings").clicked() {
+                    actions.push(PanelAction::OpenSettings);
+                }
+            });
+        });
         ui.horizontal(|ui| {
             if ui.button("+ Session").clicked() {
                 actions.push(PanelAction::NewSession(FolderPath::root()));
@@ -1087,11 +1281,23 @@ impl TerminalApp {
                 .auto_shrink([false, true])
                 .show(ui, |ui| {
                     if query.is_empty() {
+                        // The permanent tree root: always shown, never collapses
+                        // (ADR-19). Its right-click menu is where a top-level
+                        // folder is added, so the tree always has a home.
+                        let root = ui.strong("\u{1f4c1} Sessions");
+                        root.context_menu(|ui| {
+                            if ui.button("Add folder\u{2026}").clicked() {
+                                actions.push(PanelAction::BeginAddFolder);
+                                ui.close();
+                            }
+                        });
                         let tree = build_folder_tree(&self.sessions, &folders);
-                        render_folder(ui, &tree, &FolderPath::root(), &folders, &mut actions);
-                        if self.sessions.is_empty() && folders.is_empty() {
-                            ui.weak("No saved sessions yet.");
-                        }
+                        ui.indent("sessions_root", |ui| {
+                            render_folder(ui, &tree, &FolderPath::root(), &folders, &mut actions);
+                            if tree.subfolders.is_empty() && tree.sessions.is_empty() {
+                                ui.weak("Right-click \u{201c}Sessions\u{201d} to add a folder.");
+                            }
+                        });
                     } else {
                         let mut any = false;
                         for spec in self.sessions.iter().filter(|s| matches_query(s, &query)) {
@@ -1103,74 +1309,6 @@ impl TerminalApp {
                         }
                     }
                 });
-
-            ui.separator();
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.new_folder_name);
-                if ui.button("New folder").clicked() {
-                    let path = parse_folder(&self.new_folder_name);
-                    if !path.is_root() {
-                        actions.push(PanelAction::NewFolder(path));
-                        self.new_folder_name.clear();
-                    }
-                }
-            });
-
-            // Session files (ADR-19): each top-level folder is backed by one
-            // JSON file. Add existing files, create new empty ones, or drop a
-            // file from the tree (which leaves it on disk).
-            let tops = self
-                .sessions_lib
-                .as_ref()
-                .map(|l| l.top_folders())
-                .unwrap_or_default();
-            ui.collapsing("Session files", |ui| {
-                for top in &tops {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .small_button("x")
-                            .on_hover_text("Remove from the tree (the file is not deleted)")
-                            .clicked()
-                        {
-                            actions.push(PanelAction::RemoveTopFolder(top.name.clone()));
-                        }
-                        let label = ui.strong(&top.name);
-                        label.on_hover_text(top.path.display().to_string());
-                        if let Some(err) = &top.error {
-                            ui.colored_label(Color32::from_rgb(0xff, 0x66, 0x66), "!")
-                                .on_hover_text(err.as_str());
-                        }
-                    });
-                }
-                ui.add_space(4.0);
-                ui.horizontal(|ui| {
-                    ui.label("Name");
-                    ui.text_edit_singleline(&mut self.new_top_name);
-                });
-                ui.horizontal(|ui| {
-                    ui.label("File");
-                    ui.text_edit_singleline(&mut self.new_top_path);
-                    if ui
-                        .button("\u{1f4c1}")
-                        .on_hover_text("Choose or name a session file")
-                        .clicked()
-                    {
-                        actions.push(PanelAction::BrowseSessionFile);
-                    }
-                });
-                if ui.button("Add file").clicked() {
-                    let name = self.new_top_name.trim().to_owned();
-                    let path = self.new_top_path.trim();
-                    if !name.is_empty() && !path.is_empty() {
-                        actions.push(PanelAction::AddSessionFile {
-                            name,
-                            path: PathBuf::from(path),
-                        });
-                        self.new_top_name.clear();
-                        self.new_top_path.clear();
-                    }
-                }
-            });
         }
 
         if let Some(err) = &self.last_error {
@@ -1178,51 +1316,6 @@ impl TerminalApp {
             ui.colored_label(Color32::from_rgb(0xff, 0x66, 0x66), err);
         }
 
-        ui.separator();
-        let mut restore = self.restore_enabled;
-        if ui
-            .checkbox(&mut restore, "Restore layout on startup")
-            .changed()
-        {
-            actions.push(PanelAction::SetRestore(restore));
-        }
-        let mut open_shell = self.open_shell_on_startup;
-        if ui
-            .checkbox(&mut open_shell, "Open a local shell on startup")
-            .changed()
-        {
-            actions.push(PanelAction::SetOpenShell(open_shell));
-        }
-
-        ui.collapsing("SSH keys to unlock at startup", |ui| {
-            for key in &self.startup_keys {
-                ui.horizontal(|ui| {
-                    if ui.small_button("x").clicked() {
-                        actions.push(PanelAction::RemoveStartupKey(key.clone()));
-                    }
-                    ui.label(key.display().to_string());
-                });
-            }
-            ui.horizontal(|ui| {
-                ui.text_edit_singleline(&mut self.new_key_path);
-                if ui
-                    .button("\u{1f4c1}")
-                    .on_hover_text("Choose a key file")
-                    .clicked()
-                {
-                    actions.push(PanelAction::BrowseStartupKey);
-                }
-                if ui.button("Add key").clicked() {
-                    let trimmed = self.new_key_path.trim();
-                    if !trimmed.is_empty() {
-                        actions.push(PanelAction::AddStartupKey(PathBuf::from(trimmed)));
-                        self.new_key_path.clear();
-                    }
-                }
-            });
-        });
-
-        ui.weak("Ctrl+Shift+E toggles this panel.");
         actions
     }
 
@@ -1382,7 +1475,11 @@ impl eframe::App for TerminalApp {
         // echoed there in cleartext. `egui_wants_keyboard_input` is true exactly
         // when some widget (a `TextEdit`) is focused; the terminal is painted,
         // not a focusable widget, so it never trips it.
-        let dialog_open = self.editor.is_some() || self.modal.is_some();
+        let dialog_open = self.editor.is_some()
+            || self.modal.is_some()
+            || self.settings_open
+            || self.add_folder.is_some()
+            || self.confirm_delete.is_some();
         if !dialog_open && !ctx.egui_wants_keyboard_input() {
             self.route_keyboard(&ctx);
         }
@@ -1435,6 +1532,12 @@ impl eframe::App for TerminalApp {
                 EditorOutcome::Save(spec) => self.save_session(*spec),
             }
         }
+
+        // The folder, delete-confirmation, and settings dialogs (ADR-19), each
+        // floating above the tree until dismissed.
+        self.show_add_folder_dialog(&ctx);
+        self.show_confirm_delete_dialog(&ctx);
+        self.show_settings_dialog(&ctx);
 
         // Deliver a completed file pick (ADR-18) to its field.
         self.poll_pick();
@@ -1704,13 +1807,16 @@ fn render_folder(
                 ui.close();
             }
             ui.separator();
-            if is_top_level {
-                if ui.button("Remove file from tree").clicked() {
-                    actions.push(PanelAction::RemoveTopFolder(seg.clone()));
-                    ui.close();
-                }
-            } else if ui.button("Delete folder").clicked() {
-                actions.push(PanelAction::DeleteFolder(child_path.clone()));
+            if ui.button("Delete\u{2026}").clicked() {
+                // A top-level folder is a file (un-include it); a subfolder is a
+                // path within one (delete the sessions beneath it). Either way,
+                // the confirmation dialog decides — this only opens it.
+                let target = if is_top_level {
+                    FolderTarget::Top(seg.clone())
+                } else {
+                    FolderTarget::Sub(child_path.clone())
+                };
+                actions.push(PanelAction::BeginDeleteFolder(target));
                 ui.close();
             }
         });

@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use polyterm_core::{FolderPath, SessionId, SessionSpec};
 use serde::{Deserialize, Serialize};
 
-use crate::{DEFAULT_TOP_FOLDER, StoreError, atomic_write};
+use crate::{DEFAULT_TOP_FOLDER, LEGACY_DEFAULT_TOP_FOLDER, StoreError, atomic_write};
 
 /// One session file's contents: its empty subfolders and its sessions, every
 /// folder path relative to the file's top-level folder.
@@ -114,6 +114,7 @@ impl SessionLibrary {
         for entry in index.entries {
             lib.load_entry(entry.name, entry.path);
         }
+        lib.migrate_legacy_default();
         // Persist the index (harmless if unchanged; writes the seed on first
         // run) and materialise any missing writable file so it exists on disk.
         lib.save_index()?;
@@ -159,6 +160,24 @@ impl SessionLibrary {
             writable,
             error,
         });
+    }
+
+    /// Rename a pristine legacy default folder (named "Sessions") to the new
+    /// default, so it does not collide with the permanent tree root of that
+    /// name. Only an *empty* such folder is touched, and only when no folder
+    /// already holds the new name — a folder the user has actually put sessions
+    /// in, or deliberately named "Sessions", is left alone.
+    fn migrate_legacy_default(&mut self) {
+        if self.tops.iter().any(|t| t.name == DEFAULT_TOP_FOLDER) {
+            return;
+        }
+        if let Some(top) = self.tops.iter_mut().find(|t| {
+            t.name == LEGACY_DEFAULT_TOP_FOLDER
+                && t.data.sessions.is_empty()
+                && t.data.folders.is_empty()
+        }) {
+            top.name = DEFAULT_TOP_FOLDER.to_owned();
+        }
     }
 
     // --- registry ------------------------------------------------------------
@@ -668,6 +687,48 @@ mod tests {
             Err(StoreError::NotWritable(_))
         ));
         assert_eq!(std::fs::read_to_string(&bad).unwrap(), "{ this is not json");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pristine_legacy_sessions_folder_is_renamed_to_the_new_default() {
+        let dir = tmp_dir("migrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        // Simulate an index written by the previous version: one empty folder
+        // literally named "Sessions".
+        std::fs::write(
+            dir.join("library.json"),
+            format!(
+                "{{\"entries\":[{{\"name\":\"Sessions\",\"path\":{:?}}}]}}",
+                dir.join("sessions.json").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        std::fs::write(dir.join("sessions.json"), b"{}").unwrap();
+
+        let lib = SessionLibrary::open_in(dir.clone()).unwrap();
+        assert_eq!(lib.top_folder_names(), vec![DEFAULT_TOP_FOLDER.to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_legacy_sessions_folder_with_content_is_left_alone() {
+        let dir = tmp_dir("nomigrate");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("library.json"),
+            format!(
+                "{{\"entries\":[{{\"name\":\"Sessions\",\"path\":{:?}}}]}}",
+                dir.join("sessions.json").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        // A non-empty file (it holds a subfolder): renaming it would surprise
+        // the user, so the migration must leave it named "Sessions".
+        std::fs::write(dir.join("sessions.json"), b"{\"folders\":[[\"edge\"]]}").unwrap();
+
+        let lib = SessionLibrary::open_in(dir.clone()).unwrap();
+        assert!(lib.top_folder_names().contains(&"Sessions".to_owned()));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

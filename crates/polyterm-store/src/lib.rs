@@ -28,8 +28,15 @@ pub use known_hosts::KnownHosts;
 pub use library::SessionLibrary;
 
 /// The default name of the top-level folder seeded on first run, backed by
-/// `~/.polyterm/sessions.json`.
-pub const DEFAULT_TOP_FOLDER: &str = "Sessions";
+/// `~/.polyterm/sessions.json`. Not "Sessions": the tree's permanent root node
+/// carries that name, so the default *folder* under it takes a distinct one.
+pub const DEFAULT_TOP_FOLDER: &str = "General";
+
+/// The name an earlier version gave the seeded default folder, before the tree
+/// root took the name "Sessions". A pristine (empty) folder still called this is
+/// migrated to [`DEFAULT_TOP_FOLDER`] on open, so it does not collide with the
+/// root.
+pub(crate) const LEGACY_DEFAULT_TOP_FOLDER: &str = "Sessions";
 
 /// Anything that can go wrong talking to the store.
 #[derive(Debug, thiserror::Error)]
