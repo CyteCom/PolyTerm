@@ -124,6 +124,7 @@ enum PanelAction {
     DeleteFolder(FolderPath),
     AddStartupKey(PathBuf),
     RemoveStartupKey(PathBuf),
+    BrowseStartupKey,
 }
 
 /// Which way to split a tile: `Right` puts the new pane beside the current one
@@ -141,6 +142,15 @@ enum FocusDir {
     Right,
     Up,
     Down,
+}
+
+/// Where a chosen file path from the file dialog should go (ADR-18).
+#[derive(Debug, Clone, Copy)]
+enum PickTarget {
+    /// The session editor's key-path field.
+    EditorKeyPath,
+    /// The "add a startup key" field in the panel.
+    StartupKey,
 }
 
 /// The whole application: the layout tree, the live terminals it references,
@@ -194,6 +204,9 @@ pub struct TerminalApp {
     /// SSH keys to unlock at startup (persisted), and the draft path being added.
     startup_keys: Vec<PathBuf>,
     new_key_path: String,
+    /// A file-open dialog running on its own thread, and where its result goes
+    /// (ADR-18). Polled each frame; `None` when no dialog is open.
+    pending_pick: Option<(PickTarget, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
     /// Whether the session panel is shown. Forced on while nothing is open.
     show_panel: bool,
     /// Whether to restore the tile layout on startup (FR-4 opt-in). Persisted.
@@ -325,6 +338,7 @@ impl TerminalApp {
             passphrase_cache: HashMap::new(),
             startup_keys,
             new_key_path: String::new(),
+            pending_pick: None,
             show_panel: true,
             restore_enabled,
             last_error: None,
@@ -569,6 +583,7 @@ impl TerminalApp {
                 }
             }
             PanelAction::RemoveStartupKey(path) => self.startup_keys.retain(|p| p != &path),
+            PanelAction::BrowseStartupKey => self.begin_pick(ctx, PickTarget::StartupKey),
         }
     }
 
@@ -712,6 +727,48 @@ impl TerminalApp {
             (PromptModal::UnlockKey { .. }, ModalAnswer::CredentialCancelled) => {}
             // A Pending answer never reaches here, and the variants always match.
             _ => {}
+        }
+    }
+
+    /// Open a native file-open dialog on its own thread and route the chosen
+    /// path to `target` (ADR-18). The UI keeps painting; the result is polled
+    /// in [`Self::poll_pick`].
+    fn begin_pick(&mut self, ctx: &egui::Context, target: PickTarget) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        std::thread::spawn(move || {
+            let picked = rfd::FileDialog::new()
+                .set_title("Choose an SSH key")
+                .pick_file();
+            let _ = tx.send(picked);
+            ctx.request_repaint();
+        });
+        self.pending_pick = Some((target, rx));
+    }
+
+    /// Deliver a completed file pick to its target field, if one has finished.
+    fn poll_pick(&mut self) {
+        if let Some((target, rx)) = self.pending_pick.take() {
+            match rx.try_recv() {
+                Ok(picked) => {
+                    // Some(path) chosen, or None cancelled — either way, done.
+                    if let Some(path) = picked {
+                        let text = path.to_string_lossy().into_owned();
+                        match target {
+                            PickTarget::EditorKeyPath => {
+                                if let Some(editor) = &mut self.editor {
+                                    editor.set_key_path(text);
+                                }
+                            }
+                            PickTarget::StartupKey => self.new_key_path = text,
+                        }
+                    }
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                    self.pending_pick = Some((target, rx));
+                }
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {}
+            }
         }
     }
 
@@ -1017,6 +1074,13 @@ impl TerminalApp {
             }
             ui.horizontal(|ui| {
                 ui.text_edit_singleline(&mut self.new_key_path);
+                if ui
+                    .button("\u{1f4c1}")
+                    .on_hover_text("Choose a key file")
+                    .clicked()
+                {
+                    actions.push(PanelAction::BrowseStartupKey);
+                }
                 if ui.button("Add key").clicked() {
                     let trimmed = self.new_key_path.trim();
                     if !trimmed.is_empty() {
@@ -1229,11 +1293,20 @@ impl eframe::App for TerminalApp {
         // Taken out so the save path can mutate the app without aliasing it.
         if let Some(mut editor) = self.editor.take() {
             match editor.show(&ctx) {
-                EditorOutcome::Open => self.editor = Some(editor),
+                EditorOutcome::Open => {
+                    let browse = editor.take_browse_request();
+                    self.editor = Some(editor);
+                    if browse {
+                        self.begin_pick(&ctx, PickTarget::EditorKeyPath);
+                    }
+                }
                 EditorOutcome::Cancel => {}
                 EditorOutcome::Save(spec) => self.save_session(*spec),
             }
         }
+
+        // Deliver a completed file pick (ADR-18) to its field.
+        self.poll_pick();
 
         // A backend prompt (host key, credential) takes the foreground until
         // answered (FR-23, §6); further prompts wait in the queue.
@@ -1377,6 +1450,18 @@ impl Behavior<SessionId> for TermBehavior<'_> {
 
     fn is_tab_closable(&self, _tiles: &Tiles<SessionId>, _tile_id: TileId) -> bool {
         true
+    }
+
+    /// Every pane gets a tab bar, even a lone one — the tab is always shown, so
+    /// a single session is not a chromeless full-window pane. egui_tiles wraps a
+    /// bare pane in a one-tab container to honour this (and keeps it, rather than
+    /// pruning single-tab groups).
+    fn simplification_options(&self) -> egui_tiles::SimplificationOptions {
+        egui_tiles::SimplificationOptions {
+            all_panes_must_have_tabs: true,
+            prune_single_child_tabs: false,
+            ..Default::default()
+        }
     }
 
     fn on_tab_close(&mut self, tiles: &mut Tiles<SessionId>, tile_id: TileId) -> bool {

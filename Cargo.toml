@@ -49,6 +49,10 @@ egui         = "0.36"         # (unused until M2)
 # Rust, no C toolchain. Input isolation (FR-90) is layered on top in polyterm-ui,
 # not a behaviour of this crate — it reads no keyboard input during typing.
 egui_tiles   = "0.17"
+# Native file-open dialog for choosing SSH key paths (ADR-18). Default features
+# are C-free: the XDG desktop portal (D-Bus, reusing the zbus keyring already
+# pulls) and Wayland on Linux, Win32 on Windows — no GTK.
+rfd          = "0.17"
 
 # --- terminal ----------------------------------------------------------------
 alacritty_terminal = "0.26"   # (unused until M2)

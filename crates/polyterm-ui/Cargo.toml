@@ -14,6 +14,7 @@ polyterm-term = { path = "../polyterm-term" }
 eframe = { workspace = true }
 egui = { workspace = true }
 egui_tiles = { workspace = true }
+rfd = { workspace = true }
 tokio = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }

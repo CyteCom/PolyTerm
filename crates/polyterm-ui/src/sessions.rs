@@ -136,6 +136,10 @@ pub(crate) struct SessionEditor {
     kind: KindTag,
     on_exit: ExitAction,
     error: Option<String>,
+    /// Set when the key-path browse button is clicked; the app runs the file
+    /// dialog (it owns the runtime) and calls [`Self::set_key_path`] with the
+    /// result.
+    browse_requested: bool,
 
     // Per-kind fields, reused across kinds so switching does not lose input.
     shell: String,
@@ -161,6 +165,7 @@ impl Default for SessionEditor {
             kind: KindTag::Ssh,
             on_exit: ExitAction::default(),
             error: None,
+            browse_requested: false,
             shell: String::new(),
             serial_port: String::new(),
             baud: "115200".to_owned(),
@@ -305,6 +310,16 @@ impl SessionEditor {
         })
     }
 
+    /// Whether a key-path browse was requested since last checked (consumed).
+    pub(crate) fn take_browse_request(&mut self) -> bool {
+        std::mem::take(&mut self.browse_requested)
+    }
+
+    /// Set the key path from a chosen file (the file-dialog result).
+    pub(crate) fn set_key_path(&mut self, path: String) {
+        self.key_path = path;
+    }
+
     /// Show the editor as a modal window and report what the user did.
     pub(crate) fn show(&mut self, ctx: &egui::Context) -> EditorOutcome {
         let title = if self.is_new {
@@ -416,7 +431,16 @@ impl SessionEditor {
                 ui.end_row();
                 if self.ssh_auth == AuthTag::Key {
                     ui.label("Key path");
-                    ui.text_edit_singleline(&mut self.key_path);
+                    ui.horizontal(|ui| {
+                        ui.text_edit_singleline(&mut self.key_path);
+                        if ui
+                            .button("\u{1f4c1}")
+                            .on_hover_text("Choose a key file")
+                            .clicked()
+                        {
+                            self.browse_requested = true;
+                        }
+                    });
                     ui.end_row();
                 }
             }

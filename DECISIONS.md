@@ -475,3 +475,33 @@ to the UI — only `polyterm-ssh` carries that, via `russh` (ADR-16).
 **Consequence.** The UI now understands the OpenSSH private-key format enough to
 decrypt one. Pinned to `=0.7.0-rc.11`, the exact version `russh` resolves, so
 the tree holds a single copy.
+
+---
+
+## ADR-18 · Accepted · `rfd` for the file-open dialog
+
+**Decision.** Use `rfd` (Rusty File Dialogs) for the "choose an SSH key" button,
+with its default features, and run the blocking dialog on a short-lived
+`std::thread` that hands the path back over a channel.
+
+**Why.** Picking a key path by hand is error-prone; a native file chooser is
+the expected affordance. `rfd` is the standard egui-adjacent choice, and its
+default features are already C-free on both targets — the XDG desktop portal
+(over D-Bus via `zbus`, which the keyring backend already pulls) plus Wayland on
+Linux, and the Win32 dialog on Windows. No GTK, so NFR-2 holds; only
+`polyterm-ssh` carries a C build dependency (ADR-16).
+
+**Why a thread, not the UI thread or the tokio runtime.** `eframe` owns the main
+thread and it must not block (CLAUDE.md §5), so the modal dialog cannot run
+there. `rfd`'s async future is not `Send` on every platform, so it cannot go on
+the multi-threaded tokio runtime either. A dedicated `std::thread` running the
+blocking `pick_file` sidesteps both: the UI keeps painting, background sessions
+keep running, and the picked path arrives over an `mpsc` channel polled each
+frame, with a `request_repaint` to wake the UI.
+
+**Rejected.** `rfd` with `gtk3` (a C build dependency on Linux — the thing the
+whole stack avoids); blocking on the UI thread (freezes the window, §5);
+typing-only (works, but the user asked for a chooser).
+
+**Revisit if.** The portal proves unavailable on a target Linux setup often
+enough to matter, at which point a bundled dialog would be the fallback.
