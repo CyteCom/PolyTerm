@@ -31,7 +31,7 @@ pub use palette::Theme;
 use std::sync::Arc;
 
 use polyterm_core::SessionSpec;
-use polyterm_store::SessionStore;
+use polyterm_store::{KnownHosts, SessionLibrary};
 use tokio::runtime::Handle;
 
 /// Run the terminal UI, taking over the calling (main) thread until the window
@@ -39,13 +39,15 @@ use tokio::runtime::Handle;
 ///
 /// `rt` is the tokio runtime the transports run on; the UI uses it to spawn the
 /// small relay tasks that wake the window when data arrives, and hands it to
-/// `spawner` so opened sessions run on it. `store` is the saved-session store,
-/// or `None` to run without one. `initial` is opened as the first pane. The
-/// runtime must outlive this call — the caller owns it.
+/// `spawner` so opened sessions run on it. `library` is the saved-session tree
+/// and `known_hosts` the host-key trust store, either `None` to run without it.
+/// `initial` is opened as the first pane. The runtime must outlive this call —
+/// the caller owns it.
 pub fn run(
     rt: Handle,
     spawner: Arc<dyn SessionSpawner>,
-    store: Option<SessionStore>,
+    library: Option<SessionLibrary>,
+    known_hosts: Option<KnownHosts>,
     initial: SessionSpec,
 ) -> eframe::Result<()> {
     let options = eframe::NativeOptions {
@@ -61,7 +63,8 @@ pub fn run(
                 cc.storage,
                 rt,
                 spawner,
-                store,
+                library,
+                known_hosts,
                 initial,
             )))
         }),

@@ -24,7 +24,7 @@ use polyterm_core::{
 use polyterm_pty::PtyTransport;
 use polyterm_serial::SerialTransport;
 use polyterm_ssh::SshTransport;
-use polyterm_store::SessionStore;
+use polyterm_store::{KnownHosts, SessionLibrary};
 use polyterm_ui::SessionSpawner;
 use tokio::runtime::Handle;
 use tracing::info;
@@ -121,11 +121,19 @@ fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "OS keyring unavailable; SSH credentials will be prompted every time");
     }
 
-    // A missing session store is not fatal: we can still open local shells.
-    let store = match SessionStore::open_default() {
-        Ok(store) => Some(store),
+    // A missing session library is not fatal: we can still open local shells.
+    let library = match SessionLibrary::open_default() {
+        Ok(library) => Some(library),
         Err(e) => {
-            tracing::warn!(error = %e, "session store unavailable; running without saved sessions");
+            tracing::warn!(error = %e, "session library unavailable; running without saved sessions");
+            None
+        }
+    };
+    // The known-hosts trust store likewise degrades to prompting each time.
+    let known_hosts = match KnownHosts::open_default() {
+        Ok(kh) => Some(kh),
+        Err(e) => {
+            tracing::warn!(error = %e, "known-hosts store unavailable; host keys will be prompted every time");
             None
         }
     };
@@ -135,7 +143,8 @@ fn main() -> anyhow::Result<()> {
     info!("launching terminal window");
     // Runs until the window closes. The runtime stays alive because `runtime`
     // is still owned here.
-    polyterm_ui::run(rt, spawner, store, initial).map_err(|e| anyhow::anyhow!("ui: {e}"))?;
+    polyterm_ui::run(rt, spawner, library, known_hosts, initial)
+        .map_err(|e| anyhow::anyhow!("ui: {e}"))?;
 
     Ok(())
 }

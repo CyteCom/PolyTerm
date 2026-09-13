@@ -3,8 +3,9 @@
 //! Secrets live in the platform credential store — Windows Credential Manager,
 //! Secret Service / KWallet on Linux, the Keychain on macOS — reached through
 //! `keyring`. The session store holds only a [`CredentialRef`] naming an entry;
-//! the secret itself never touches SQLite and never leaves this module except
-//! inside a [`Secret`], which cannot be printed and is zeroised on drop.
+//! the secret itself never touches the session files and never leaves this
+//! module except inside a [`Secret`], which cannot be printed and is zeroised
+//! on drop.
 //!
 //! We do not implement a vault of our own. If the keyring is unavailable these
 //! functions return an error, and the correct response upstream is to prompt

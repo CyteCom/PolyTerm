@@ -199,7 +199,11 @@ backends have no keyring access and never will.
 
 ---
 
-## ADR-9 · Accepted · SQLite for the session store
+## ADR-9 · Superseded by ADR-19 · SQLite for the session store
+
+**Superseded.** The session tree (and the known-hosts store) are now JSON files under
+`~/.polyterm`, one file per top-level folder, per ADR-19. The atomicity objection below
+is answered there by atomic writes (temp file + rename). The original decision follows.
 
 **Decision.** `rusqlite`, in the platform config directory via `directories`.
 
@@ -505,3 +509,48 @@ typing-only (works, but the user asked for a chooser).
 
 **Revisit if.** The portal proves unavailable on a target Linux setup often
 enough to matter, at which point a bundled dialog would be the fallback.
+
+---
+
+## ADR-19 · Accepted · JSON session files, one per top-level folder (supersedes ADR-9)
+
+**Decision.** The saved session tree is a *set* of JSON files under `~/.polyterm`, one
+file per top-level folder, listed in a small index `~/.polyterm/library.json`. The
+known-hosts trust store moves to `~/.polyterm/known_hosts.json` in the same move. All
+three are written atomically (write a sibling temp file, then rename over the target).
+`rusqlite` — and with it the last SQLite/C build dependency in the workspace outside
+`polyterm-ssh` — is dropped.
+
+**Why.** A session file is a portable, hand-editable, shareable unit: a user can keep
+work and home sessions in separate files, check one into a repo, drop one on a colleague,
+or start a new top-level folder by pointing at an empty file. The name a file's contents
+take in the tree lives in the index, not the file, so the same file can be filed under
+different names by different people (the explicit request). Removing a file from the tree
+un-includes it without deleting it. This is also the pure-Rust storage CLAUDE.md §5
+prefers: no C toolchain for what is fundamentally a list of records.
+
+**The ADR-9 objection, answered.** ADR-9 rejected a JSON file because a wholesale rewrite
+is not atomic against an unclean shutdown. Every write here goes to a temp file and is
+renamed into place; `std::fs::rename` is atomic and replaces the destination on both
+Linux and Windows, so a crash mid-write leaves the previous file intact, never a
+truncated one. The files are small and change rarely (a session edited, a host key first
+seen), so a per-file rewrite is cheap. "Partial updates" (ADR-9's other reason) mattered
+for one large relational store; with one small file per top-level folder, a mutation
+rewrites only the file it touches.
+
+**Model.** A file holds its sessions and its empty subfolders, every folder path
+*relative* to its top-level folder; the UI works in absolute paths whose first segment is
+the top-level name, and `SessionLibrary` translates at the boundary. A session must live
+under some top-level folder — the tree root is no longer a place a session can sit. A file
+that fails to parse is shown read-only and never overwritten, so a transient read error
+cannot destroy it. On first run the library seeds one folder, `Sessions`, backed by
+`~/.polyterm/sessions.json`, and creates it on disk.
+
+**Rejected.** Keeping SQLite for known-hosts only (leaves a C dependency and a
+misleadingly-named database for a handful of host keys); one JSON file for the whole tree
+(loses the per-file portability that is the point); a directory of per-session files
+(ADR-9's rename/move objection stands, and it is not the shareable unit asked for).
+
+**Note.** FR-7 (export/import a portable format) is now nearly the native format; a future
+"export" is mostly a copy. The per-file `version` field is reserved for a forward-compatible
+schema bump.

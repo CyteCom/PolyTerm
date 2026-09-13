@@ -45,7 +45,7 @@ use polyterm_core::{
     BoxError, CredentialReply, CredentialRequest, ExitAction, FolderPath, KnownHostStatus,
     PtyConfig, Secret, SessionId, SessionKind, SessionSpec, TransportHandle, TrustDecision,
 };
-use polyterm_store::{SessionStore, credentials};
+use polyterm_store::{KnownHosts, SessionLibrary, credentials};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 
@@ -125,6 +125,16 @@ enum PanelAction {
     MoveSession(SessionId, FolderPath),
     NewFolder(FolderPath),
     DeleteFolder(FolderPath),
+    /// Include a session file as a new top-level folder, or create it if the
+    /// path does not exist yet (ADR-19).
+    AddSessionFile {
+        name: String,
+        path: PathBuf,
+    },
+    /// Stop including a top-level folder (leaves its file on disk).
+    RemoveTopFolder(String),
+    /// Open the file dialog to choose or name a session file.
+    BrowseSessionFile,
     AddStartupKey(PathBuf),
     RemoveStartupKey(PathBuf),
     BrowseStartupKey,
@@ -154,6 +164,8 @@ enum PickTarget {
     EditorKeyPath,
     /// The "add a startup key" field in the panel.
     StartupKey,
+    /// The "add a session file" path field in the panel (ADR-19).
+    SessionFile,
 }
 
 /// The whole application: the layout tree, the live terminals it references,
@@ -181,11 +193,15 @@ pub struct TerminalApp {
     spawner: Arc<dyn SessionSpawner>,
     /// The runtime the transports run on; used to spawn each pane's relays.
     rt: Handle,
-    /// The saved-session store, if it opened. `None` degrades to local shells
-    /// only rather than failing (FR-1 unavailable is not fatal).
-    store: Option<SessionStore>,
-    /// The saved sessions shown in the panel, loaded once and on refresh so the
-    /// panel does not hit SQLite every frame.
+    /// The saved-session library — a set of JSON files, one per top-level
+    /// folder (ADR-19). `None` degrades to local shells only rather than
+    /// failing (FR-1 unavailable is not fatal).
+    sessions_lib: Option<SessionLibrary>,
+    /// The known-hosts trust store (FR-23). `None` means every host key is
+    /// prompted (ADR-8's fallback).
+    known_hosts: Option<KnownHosts>,
+    /// The saved sessions shown in the panel, with absolute folder paths, loaded
+    /// once and on refresh so the panel does not re-read the files every frame.
     sessions: Vec<SessionSpec>,
     /// The folders shown in the tree, including empty ones (FR-1). Cached like
     /// [`Self::sessions`].
@@ -194,6 +210,9 @@ pub struct TerminalApp {
     search: String,
     /// Draft name for the "New folder" field.
     new_folder_name: String,
+    /// Draft name and path for the "add a session file" fields (ADR-19).
+    new_top_name: String,
+    new_top_path: String,
     /// The open new/edit-session form, if any (FR-5).
     editor: Option<SessionEditor>,
     /// The prompt currently asking the user for an answer (FR-23, §6), and any
@@ -231,8 +250,8 @@ pub struct TerminalApp {
     perf: Option<Perf>,
 }
 
-// `Debug` by hand: `Arc<dyn SessionSpawner>` is not `Debug`, and neither is
-// `SessionStore`. The lint (missing_debug_implementations) still wants one.
+// `Debug` by hand: `Arc<dyn SessionSpawner>` is not `Debug`. The lint
+// (missing_debug_implementations) still wants one.
 impl std::fmt::Debug for TerminalApp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("TerminalApp")
@@ -307,16 +326,17 @@ impl TerminalApp {
         storage: Option<&dyn eframe::Storage>,
         rt: Handle,
         spawner: Arc<dyn SessionSpawner>,
-        store: Option<SessionStore>,
+        sessions_lib: Option<SessionLibrary>,
+        known_hosts: Option<KnownHosts>,
         initial: SessionSpec,
     ) -> Self {
-        let sessions = store
+        let sessions = sessions_lib
             .as_ref()
-            .and_then(|s| s.list_sessions().ok())
+            .map(|l| l.list_sessions())
             .unwrap_or_default();
-        let folders = store
+        let folders = sessions_lib
             .as_ref()
-            .and_then(|s| s.list_folders().ok())
+            .map(|l| l.list_folders())
             .unwrap_or_default();
         let restore_enabled = storage
             .and_then(|s| eframe::get_value::<bool>(s, RESTORE_KEY))
@@ -336,11 +356,14 @@ impl TerminalApp {
             multi_exec: HashSet::new(),
             spawner,
             rt,
-            store,
+            sessions_lib,
+            known_hosts,
             sessions,
             folders,
             search: String::new(),
             new_folder_name: String::new(),
+            new_top_name: String::new(),
+            new_top_path: String::new(),
             editor: None,
             modal: None,
             modal_queue: VecDeque::new(),
@@ -397,10 +420,7 @@ impl TerminalApp {
     ) -> bool {
         let spec = match &source {
             PaneSource::Adhoc(spec) => Some(spec.as_ref().clone()),
-            PaneSource::Saved(id) => self
-                .store
-                .as_ref()
-                .and_then(|s| s.get_session(*id).ok().flatten()),
+            PaneSource::Saved(id) => self.sessions_lib.as_ref().and_then(|l| l.get_session(*id)),
         };
         let Some(spec) = spec else {
             // The saved session is gone (or the store is unavailable).
@@ -536,24 +556,18 @@ impl TerminalApp {
         }
     }
 
-    /// Reload the saved sessions and folders from the store (FR-1).
+    /// Reload the saved sessions and folders from the library (FR-1).
     fn reload(&mut self) {
-        if let Some(store) = &self.store {
-            match store.list_sessions() {
-                Ok(list) => self.sessions = list,
-                Err(e) => self.last_error = Some(format!("Could not list sessions: {e}")),
-            }
-            match store.list_folders() {
-                Ok(list) => self.folders = list,
-                Err(e) => self.last_error = Some(format!("Could not list folders: {e}")),
-            }
+        if let Some(lib) = &self.sessions_lib {
+            self.sessions = lib.list_sessions();
+            self.folders = lib.list_folders();
         }
     }
 
     /// Persist a session from the editor and refresh the tree (FR-5).
     fn save_session(&mut self, spec: SessionSpec) {
-        if let Some(store) = &self.store
-            && let Err(e) = store.upsert_session(&spec)
+        if let Some(lib) = &mut self.sessions_lib
+            && let Err(e) = lib.upsert_session(&spec)
         {
             self.last_error = Some(format!("Could not save {}: {e}", spec.name));
             return;
@@ -569,7 +583,21 @@ impl TerminalApp {
             PanelAction::OpenSaved(id) => self.open_in_new_tab(ctx, PaneSource::Saved(id)),
             PanelAction::SetRestore(enabled) => self.restore_enabled = enabled,
             PanelAction::SetOpenShell(enabled) => self.open_shell_on_startup = enabled,
-            PanelAction::NewSession(folder) => self.editor = Some(SessionEditor::new_in(&folder)),
+            PanelAction::NewSession(folder) => {
+                // A session must live under some top-level folder; if none was
+                // chosen (the panel's "+ Session" button), default to the first
+                // included one so the editor opens somewhere valid (ADR-19).
+                let folder = if folder.is_root() {
+                    self.sessions_lib
+                        .as_ref()
+                        .and_then(|l| l.top_folder_names().into_iter().next())
+                        .map(|name| std::iter::once(name).collect())
+                        .unwrap_or(folder)
+                } else {
+                    folder
+                };
+                self.editor = Some(SessionEditor::new_in(&folder));
+            }
             PanelAction::EditSession(id) => {
                 if let Some(spec) = self.sessions.iter().find(|s| s.id == id) {
                     self.editor = Some(SessionEditor::edit(spec));
@@ -590,6 +618,13 @@ impl TerminalApp {
             PanelAction::DeleteFolder(path) => {
                 self.store_op(move |store| store.delete_folder(&path));
             }
+            PanelAction::AddSessionFile { name, path } => {
+                self.store_op(move |store| store.add_file(name, path));
+            }
+            PanelAction::RemoveTopFolder(name) => {
+                self.store_op(move |store| store.remove_top_folder(&name));
+            }
+            PanelAction::BrowseSessionFile => self.begin_pick(ctx, PickTarget::SessionFile),
             PanelAction::AddStartupKey(path) => {
                 if !self.startup_keys.contains(&path) {
                     self.startup_keys.push(path.clone());
@@ -611,16 +646,15 @@ impl TerminalApp {
         match prompt {
             PendingPrompt::HostKey(prompt) => {
                 let status = self
-                    .store
+                    .known_hosts
                     .as_ref()
-                    .and_then(|s| {
+                    .map(|s| {
                         s.known_host_status(
                             &prompt.host,
                             prompt.port,
                             &prompt.key_type,
                             &prompt.public_key,
                         )
-                        .ok()
                     })
                     .unwrap_or(KnownHostStatus::Unknown);
                 if status == KnownHostStatus::Match {
@@ -678,9 +712,9 @@ impl TerminalApp {
         match (modal, answer) {
             (PromptModal::HostKey { prompt, .. }, ModalAnswer::Trust(decision)) => {
                 if decision == TrustDecision::AcceptAndRemember
-                    && let Some(store) = &self.store
+                    && let Some(known_hosts) = &mut self.known_hosts
                 {
-                    let _ = store.remember_host_key(
+                    let _ = known_hosts.remember_host_key(
                         &prompt.host,
                         prompt.port,
                         &prompt.key_type,
@@ -754,9 +788,16 @@ impl TerminalApp {
         let (tx, rx) = std::sync::mpsc::channel();
         let ctx = ctx.clone();
         std::thread::spawn(move || {
-            let picked = rfd::FileDialog::new()
-                .set_title("Choose an SSH key")
-                .pick_file();
+            let dialog = rfd::FileDialog::new();
+            // A session file may not exist yet ("create an empty file"), so its
+            // picker is a save dialog; a key must exist, so its is an open one.
+            let picked = match target {
+                PickTarget::SessionFile => dialog
+                    .set_title("Choose or name a session file")
+                    .add_filter("JSON", &["json"])
+                    .save_file(),
+                _ => dialog.set_title("Choose an SSH key").pick_file(),
+            };
             let _ = tx.send(picked);
             ctx.request_repaint();
         });
@@ -778,6 +819,16 @@ impl TerminalApp {
                                 }
                             }
                             PickTarget::StartupKey => self.new_key_path = text,
+                            PickTarget::SessionFile => {
+                                // Default the folder name to the file's stem if
+                                // the user has not typed one yet.
+                                if self.new_top_name.trim().is_empty()
+                                    && let Some(stem) = path.file_stem()
+                                {
+                                    self.new_top_name = stem.to_string_lossy().into_owned();
+                                }
+                                self.new_top_path = text;
+                            }
                         }
                     }
                 }
@@ -789,13 +840,13 @@ impl TerminalApp {
         }
     }
 
-    /// Run a fallible store mutation, record any error, and refresh (FR-5).
+    /// Run a fallible library mutation, record any error, and refresh (FR-5).
     fn store_op<F>(&mut self, op: F)
     where
-        F: FnOnce(&SessionStore) -> Result<(), polyterm_store::StoreError>,
+        F: FnOnce(&mut SessionLibrary) -> Result<(), polyterm_store::StoreError>,
     {
-        if let Some(store) = &self.store
-            && let Err(e) = op(store)
+        if let Some(lib) = &mut self.sessions_lib
+            && let Err(e) = op(lib)
         {
             self.last_error = Some(format!("Store error: {e}"));
         }
@@ -1017,7 +1068,7 @@ impl TerminalApp {
             }
         });
 
-        if self.store.is_none() {
+        if self.sessions_lib.is_none() {
             ui.separator();
             ui.weak("Session store unavailable.");
         } else {
@@ -1061,6 +1112,62 @@ impl TerminalApp {
                     if !path.is_root() {
                         actions.push(PanelAction::NewFolder(path));
                         self.new_folder_name.clear();
+                    }
+                }
+            });
+
+            // Session files (ADR-19): each top-level folder is backed by one
+            // JSON file. Add existing files, create new empty ones, or drop a
+            // file from the tree (which leaves it on disk).
+            let tops = self
+                .sessions_lib
+                .as_ref()
+                .map(|l| l.top_folders())
+                .unwrap_or_default();
+            ui.collapsing("Session files", |ui| {
+                for top in &tops {
+                    ui.horizontal(|ui| {
+                        if ui
+                            .small_button("x")
+                            .on_hover_text("Remove from the tree (the file is not deleted)")
+                            .clicked()
+                        {
+                            actions.push(PanelAction::RemoveTopFolder(top.name.clone()));
+                        }
+                        let label = ui.strong(&top.name);
+                        label.on_hover_text(top.path.display().to_string());
+                        if let Some(err) = &top.error {
+                            ui.colored_label(Color32::from_rgb(0xff, 0x66, 0x66), "!")
+                                .on_hover_text(err.as_str());
+                        }
+                    });
+                }
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Name");
+                    ui.text_edit_singleline(&mut self.new_top_name);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("File");
+                    ui.text_edit_singleline(&mut self.new_top_path);
+                    if ui
+                        .button("\u{1f4c1}")
+                        .on_hover_text("Choose or name a session file")
+                        .clicked()
+                    {
+                        actions.push(PanelAction::BrowseSessionFile);
+                    }
+                });
+                if ui.button("Add file").clicked() {
+                    let name = self.new_top_name.trim().to_owned();
+                    let path = self.new_top_path.trim();
+                    if !name.is_empty() && !path.is_empty() {
+                        actions.push(PanelAction::AddSessionFile {
+                            name,
+                            path: PathBuf::from(path),
+                        });
+                        self.new_top_name.clear();
+                        self.new_top_path.clear();
                     }
                 }
             });
@@ -1579,6 +1686,9 @@ fn render_folder(
     folders: &[FolderPath],
     actions: &mut Vec<PanelAction>,
 ) {
+    // A child of the root is a top-level folder — one backed by its own file;
+    // removing it un-includes the file rather than deleting a subtree (ADR-19).
+    let is_top_level = path.is_root();
     for (seg, child) in &node.subfolders {
         let mut child_path = path.clone();
         child_path.push(seg.clone());
@@ -1594,7 +1704,12 @@ fn render_folder(
                 ui.close();
             }
             ui.separator();
-            if ui.button("Delete folder").clicked() {
+            if is_top_level {
+                if ui.button("Remove file from tree").clicked() {
+                    actions.push(PanelAction::RemoveTopFolder(seg.clone()));
+                    ui.close();
+                }
+            } else if ui.button("Delete folder").clicked() {
                 actions.push(PanelAction::DeleteFolder(child_path.clone()));
                 ui.close();
             }
@@ -1632,10 +1747,8 @@ fn session_row(
             ui.close();
         }
         ui.menu_button("Move to", |ui| {
-            if ui.button("(root)").clicked() {
-                actions.push(PanelAction::MoveSession(id, FolderPath::root()));
-                ui.close();
-            }
+            // Every destination is inside some top-level folder; the tree root
+            // is not a place a session can live (ADR-19).
             for folder in folders.iter().filter(|f| !f.is_root()) {
                 if ui.button(folder.segments().join("/")).clicked() {
                     actions.push(PanelAction::MoveSession(id, folder.clone()));
