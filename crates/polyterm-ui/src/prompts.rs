@@ -201,15 +201,25 @@ fn show_host_key(
                     ui.label(&prompt.fingerprint);
                     ui.end_row();
                 });
+            ui.add_space(2.0);
+            // Accepting always remembers the key (OpenSSH's behaviour): the user
+            // is asked once per host, then only again if the key changes.
+            ui.weak(if status == KnownHostStatus::Changed {
+                "Accepting replaces the stored key; you won't be asked again unless it changes."
+            } else {
+                "Accepting remembers this key; you won't be asked again unless it changes."
+            });
             ui.separator();
             ui.horizontal(|ui| {
                 if ui.button("Reject").clicked() {
                     answer = ModalAnswer::Trust(TrustDecision::Reject);
                 }
-                if ui.button("Accept once").clicked() {
-                    answer = ModalAnswer::Trust(TrustDecision::AcceptOnce);
-                }
-                if ui.button("Accept and remember").clicked() {
+                let accept = if status == KnownHostStatus::Changed {
+                    "Accept new key"
+                } else {
+                    "Accept"
+                };
+                if ui.button(accept).clicked() {
                     answer = ModalAnswer::Trust(TrustDecision::AcceptAndRemember);
                 }
             });

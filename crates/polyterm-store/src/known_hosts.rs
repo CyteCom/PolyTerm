@@ -59,9 +59,14 @@ impl KnownHosts {
 
     /// Open (or start) the trust store at `path`. A missing file is an empty
     /// store; it is created on the first [`Self::remember_host_key`].
+    ///
+    /// A file that fails to parse is treated as empty rather than an error: a
+    /// corrupt trust store must not collapse the whole store to unavailable,
+    /// which would re-prompt for every host forever and never remember one. The
+    /// empty store self-heals — the next remembered key overwrites the bad file.
     pub fn open(path: PathBuf) -> Result<Self, StoreError> {
         let data = match std::fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes)?,
+            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => KnownHostsData::default(),
             Err(e) => return Err(e.into()),
         };
@@ -198,6 +203,33 @@ mod tests {
             s.known_host_status("h", 22, "ssh-ed25519", b"new"),
             KnownHostStatus::Match
         );
+    }
+
+    #[test]
+    fn a_corrupt_file_opens_as_empty_and_can_be_rewritten() {
+        let path = std::env::temp_dir().join(format!(
+            "polyterm-known-hosts-corrupt-{}-{}.json",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::write(&path, b"{ not valid json").unwrap();
+        // Opening must not fail (that would make the whole store unavailable).
+        let mut s = KnownHosts::open(path.clone()).unwrap();
+        assert_eq!(
+            s.known_host_status("h", 22, "ssh-ed25519", b"k"),
+            KnownHostStatus::Unknown
+        );
+        // And it self-heals: a remembered key overwrites the bad file.
+        s.remember_host_key("h", 22, "ssh-ed25519", b"k").unwrap();
+        let s2 = KnownHosts::open(path.clone()).unwrap();
+        assert_eq!(
+            s2.known_host_status("h", 22, "ssh-ed25519", b"k"),
+            KnownHostStatus::Match
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
