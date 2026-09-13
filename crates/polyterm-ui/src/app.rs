@@ -40,7 +40,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Vec2};
-use egui_tiles::{Behavior, Container, Tile, TileId, Tiles, Tree, UiResponse};
+use egui_tiles::{Behavior, Container, Tabs, Tile, TileId, Tiles, Tree, UiResponse};
 use polyterm_core::{
     BoxError, CredentialReply, CredentialRequest, ExitAction, FolderPath, KnownHostStatus,
     PtyConfig, Secret, SessionId, SessionKind, SessionSpec, TransportHandle, TrustDecision,
@@ -467,6 +467,37 @@ impl TerminalApp {
         }
     }
 
+    /// Open `source` in the most recently active tile (the requirement): fill
+    /// the focused pane if it is an empty split half, otherwise add it as a new
+    /// tab beside the focused pane. Never adds a top-level tile and never
+    /// re-splits, so the tile layout stays exactly as it was split (FR-2, FR-85).
+    /// With no focused pane — startup, or an empty tree — it becomes the first
+    /// (root) pane.
+    fn open_in_active_tile(&mut self, ctx: &egui::Context, source: PaneSource) {
+        let focused_pane = self
+            .focused
+            .filter(|t| matches!(self.tree.tiles.get(*t), Some(Tile::Pane(_))));
+        // An empty focused pane (a fresh split half) is filled in place, so the
+        // split you just made gets its content rather than a sibling tab.
+        if let Some(leaf) = focused_pane
+            && let Some(&instance) = self.tree.tiles.get_pane(&leaf)
+            && !self.live.contains_key(&instance)
+        {
+            if self.open_source(ctx, instance, source) {
+                self.focused = Some(leaf);
+            }
+            return;
+        }
+        // Otherwise a new tab in the focused pane's group, or the first pane.
+        if let Some(instance) = self.make_live(ctx, source) {
+            let leaf = match focused_pane {
+                Some(focused) => add_tab_beside(&mut self.tree, focused, instance),
+                None => attach_pane(&mut self.tree, instance),
+            };
+            self.focused = Some(leaf);
+        }
+    }
+
     /// Rebuild a persisted layout (FR-95): adopt the tree, then reopen each pane
     /// from its recorded source. A leaf whose session cannot be reopened — the
     /// saved session was deleted, or a device is gone — is dropped, and the rest
@@ -501,18 +532,19 @@ impl TerminalApp {
         any
     }
 
-    /// Split the tile at `at` (a focused pane leaf), opening a fresh local shell
-    /// in the new half, and focus it (FR-85). No-op if `at` is not a pane.
-    fn apply_split(&mut self, ctx: &egui::Context, at: TileId, dir: SplitDir) {
+    /// Split the tile at `at` (a focused pane leaf), leaving the new half
+    /// *empty* and focused (FR-85). The new pane opens nothing on its own — the
+    /// user chooses what goes there (a saved session, or a local shell), because
+    /// a connection manager should not presume a shell. No-op if `at` is not a
+    /// pane. The new leaf has an instance id but no live pane; [`Self::pane_ui`]
+    /// draws the empty placeholder, and opening into it fills it in place.
+    fn apply_split(&mut self, at: TileId, dir: SplitDir) {
         let Some(existing) = self.tree.tiles.get_pane(&at).copied() else {
             return;
         };
-        if let Some(new_instance) =
-            self.make_live(ctx, PaneSource::Adhoc(Box::new(local_shell_spec())))
-        {
-            let new_leaf = split_tile(&mut self.tree, existing, new_instance, at, dir);
-            self.focused = Some(new_leaf);
-        }
+        let new_instance = SessionId::new();
+        let new_leaf = split_tile(&mut self.tree, existing, new_instance, at, dir);
+        self.focused = Some(new_leaf);
     }
 
     /// Close tabs whose session has ended and is set to close on exit (FR-4).
@@ -586,9 +618,9 @@ impl TerminalApp {
     fn apply_panel_action(&mut self, ctx: &egui::Context, action: PanelAction) {
         match action {
             PanelAction::OpenLocalShell => {
-                self.open_in_new_tab(ctx, PaneSource::Adhoc(Box::new(local_shell_spec())))
+                self.open_in_active_tile(ctx, PaneSource::Adhoc(Box::new(local_shell_spec())))
             }
-            PanelAction::OpenSaved(id) => self.open_in_new_tab(ctx, PaneSource::Saved(id)),
+            PanelAction::OpenSaved(id) => self.open_in_active_tile(ctx, PaneSource::Saved(id)),
             PanelAction::NewSession(folder) => {
                 // A session must live under some top-level folder; if none was
                 // chosen (the panel's "+ Session" button), default to the first
@@ -1340,7 +1372,7 @@ impl TerminalApp {
             .collect();
 
         let paint_start = self.perf.is_some().then(Instant::now);
-        let (focus_req, split_req, close_req, broadcast_req) = {
+        let (focus_req, split_req, close_req, broadcast_req, open_here_req) = {
             let mut behavior = TermBehavior {
                 live: &mut self.live,
                 theme: &self.theme,
@@ -1354,6 +1386,7 @@ impl TerminalApp {
                 split_request: None,
                 close_request: None,
                 broadcast_request: None,
+                open_here_request: None,
             };
             self.tree.ui(&mut behavior, ui);
             (
@@ -1361,6 +1394,7 @@ impl TerminalApp {
                 behavior.split_request,
                 behavior.close_request,
                 behavior.broadcast_request,
+                behavior.open_here_request,
             )
         };
         if let Some(start) = paint_start
@@ -1373,7 +1407,20 @@ impl TerminalApp {
             self.focused = Some(request);
         }
         if let Some((tile, dir)) = split_req {
-            self.apply_split(ctx, tile, dir);
+            self.apply_split(tile, dir);
+        }
+        // "Open local shell here" from an empty pane's menu (FR-85): fill that
+        // specific empty leaf in place.
+        if let Some(tile) = open_here_req
+            && let Some(&instance) = self.tree.tiles.get_pane(&tile)
+            && !self.live.contains_key(&instance)
+        {
+            self.open_source(
+                ctx,
+                instance,
+                PaneSource::Adhoc(Box::new(local_shell_spec())),
+            );
+            self.focused = Some(tile);
         }
         if let Some(tile) = close_req {
             self.close_tile(tile);
@@ -1599,55 +1646,65 @@ struct TermBehavior<'a> {
     close_request: Option<TileId>,
     /// A broadcast toggle requested this frame: the tile to flip (FR-91).
     broadcast_request: Option<TileId>,
+    /// An empty pane asked to open a local shell in itself this frame (FR-85).
+    open_here_request: Option<TileId>,
 }
 
 impl Behavior<SessionId> for TermBehavior<'_> {
     fn pane_ui(&mut self, ui: &mut egui::Ui, tile_id: TileId, pane: &mut SessionId) -> UiResponse {
         let draw_focus = self.show_focus && self.focused == Some(tile_id);
         let broadcasting = self.receiving.contains(pane);
-        // Confine the live-pane borrow to this block; it yields the Response so
-        // focus and the context menu can be handled without holding it.
-        let response = if let Some(live) = self.live.get_mut(pane) {
-            Some(live.show(ui, self.theme, self.font_size, draw_focus, broadcasting))
-        } else {
-            None
+        // A leaf with no live terminal is an empty pane (a fresh split half,
+        // FR-85); it draws a placeholder and offers to open a shell in itself.
+        // Either way we get a Response, so focus and the context menu are handled
+        // uniformly without holding the live-pane borrow.
+        let (response, is_empty) = match self.live.get_mut(pane) {
+            Some(live) => (
+                live.show(ui, self.theme, self.font_size, draw_focus, broadcasting),
+                false,
+            ),
+            None => (draw_empty_pane(ui, self.theme, draw_focus), true),
         };
-        if let Some(response) = response {
-            if response.clicked() || response.drag_started() || response.dragged() {
-                self.focus_request = Some(tile_id);
-            }
-            // The group a broadcast toggle would target: this pane's parent.
-            let group = self.toggle_targets.get(&tile_id).copied().flatten();
-            // Right-click a pane to split, broadcast, or close it — the
-            // affordance that works even for a lone full-window pane, which has
-            // no tab bar.
-            response.context_menu(|ui| {
-                if ui.button("Split right").clicked() {
-                    self.split_request = Some((tile_id, SplitDir::Right));
+        if response.clicked() || response.drag_started() || response.dragged() {
+            self.focus_request = Some(tile_id);
+        }
+        // The group a broadcast toggle would target: this pane's parent.
+        let group = self.toggle_targets.get(&tile_id).copied().flatten();
+        // Right-click a pane to split, broadcast, or close it — the affordance
+        // that works even for a lone full-window pane, which has no tab bar.
+        response.context_menu(|ui| {
+            if is_empty {
+                if ui.button("Open local shell here").clicked() {
+                    self.open_here_request = Some(tile_id);
                     ui.close();
-                }
-                if ui.button("Split down").clicked() {
-                    self.split_request = Some((tile_id, SplitDir::Down));
-                    ui.close();
-                }
-                if let Some(group) = group {
-                    let label = if self.multi_exec.contains(&group) {
-                        "Stop broadcasting to group"
-                    } else {
-                        "Broadcast input to group"
-                    };
-                    if ui.button(label).clicked() {
-                        self.broadcast_request = Some(group);
-                        ui.close();
-                    }
                 }
                 ui.separator();
-                if ui.button("Close").clicked() {
-                    self.close_request = Some(tile_id);
+            }
+            if ui.button("Split right").clicked() {
+                self.split_request = Some((tile_id, SplitDir::Right));
+                ui.close();
+            }
+            if ui.button("Split down").clicked() {
+                self.split_request = Some((tile_id, SplitDir::Down));
+                ui.close();
+            }
+            if let Some(group) = group {
+                let label = if self.multi_exec.contains(&group) {
+                    "Stop broadcasting to group"
+                } else {
+                    "Broadcast input to group"
+                };
+                if ui.button(label).clicked() {
+                    self.broadcast_request = Some(group);
                     ui.close();
                 }
-            });
-        }
+            }
+            ui.separator();
+            if ui.button("Close").clicked() {
+                self.close_request = Some(tile_id);
+                ui.close();
+            }
+        });
         // The pane body is for interacting with the terminal, not for dragging
         // the tile. Dragging happens via a tab handle, drawn by egui_tiles for
         // Tabs containers, so the body never starts a drag.
@@ -1711,6 +1768,32 @@ impl Behavior<SessionId> for TermBehavior<'_> {
     }
 }
 
+/// Draw an empty pane placeholder (a fresh split half, FR-85) filling the
+/// available rect, and return its interactive `Response` so the caller can
+/// focus it and attach a context menu. It paints a hint on how to fill it and,
+/// when focused among several panes, the same thin ring a live pane uses.
+fn draw_empty_pane(ui: &mut egui::Ui, theme: &Theme, draw_focus: bool) -> egui::Response {
+    let rect = ui.available_rect_before_wrap();
+    let response = ui.allocate_rect(rect, egui::Sense::click_and_drag());
+    let painter = ui.painter();
+    painter.rect_filled(rect, 0.0, theme.background);
+    painter.text(
+        rect.center(),
+        egui::Align2::CENTER_CENTER,
+        "empty \u{2022} open a session, or right-click for a local shell",
+        egui::FontId::proportional(13.0),
+        theme.foreground.gamma_multiply(0.6),
+    );
+    if draw_focus {
+        let s = egui::Stroke::new(1.5, theme.cursor);
+        painter.hline(rect.left()..=rect.right(), rect.top() + 0.75, s);
+        painter.hline(rect.left()..=rect.right(), rect.bottom() - 0.75, s);
+        painter.vline(rect.left() + 0.75, rect.top()..=rect.bottom(), s);
+        painter.vline(rect.right() - 0.75, rect.top()..=rect.bottom(), s);
+    }
+    response
+}
+
 /// A default local-shell session, opened ad hoc from the panel (FR-56).
 fn local_shell_spec() -> SessionSpec {
     SessionSpec {
@@ -1751,6 +1834,34 @@ fn attach_pane(tree: &mut Tree<SessionId>, instance: SessionId) -> TileId {
         }
     }
     leaf
+}
+
+/// Add `new` as a tab in the tab group that already holds the focused pane
+/// `focused`, make it active, and return its leaf. If the focused pane is not
+/// yet inside a tab group — a bare root, or a split half before egui_tiles wraps
+/// it — turn it into a tab group *in place*, at its own tile id, so the
+/// surrounding split needs no surgery and is left untouched (the `split_tile`
+/// trick). This never creates a top-level tile: opening a session adds a tab to
+/// the active tile, it does not change how the tree was split (the requirement).
+fn add_tab_beside(tree: &mut Tree<SessionId>, focused: TileId, new: SessionId) -> TileId {
+    let new_leaf = tree.tiles.insert_pane(new);
+    if let Some(parent) = tree.tiles.parent_of(focused)
+        && let Some(Tile::Container(Container::Tabs(tabs))) = tree.tiles.get_mut(parent)
+    {
+        tabs.add_child(new_leaf);
+        tabs.set_active(new_leaf);
+        return new_leaf;
+    }
+    // Bare pane: wrap `focused` and `new` in a tab group at `focused`'s id.
+    let Some(&focused_instance) = tree.tiles.get_pane(&focused) else {
+        return new_leaf;
+    };
+    let moved = tree.tiles.insert_pane(focused_instance);
+    let mut tabs = Tabs::new(vec![moved, new_leaf]);
+    tabs.set_active(new_leaf);
+    tree.tiles
+        .insert(focused, Tile::Container(Container::Tabs(tabs)));
+    new_leaf
 }
 
 /// Split the pane at `at` into a two-child linear container, keeping `existing`
@@ -2063,6 +2174,70 @@ mod tests {
         collect_session_ids(&tree.tiles, root, &mut all);
         assert_eq!(all.len(), 2);
         assert!(all.contains(&a) && all.contains(&c));
+    }
+
+    #[test]
+    fn add_tab_beside_a_bare_pane_makes_a_tab_group() {
+        let mut tree = empty_tree();
+        let a = SessionId::new();
+        attach_pane(&mut tree, a); // a lone full-window pane
+        let root = tree.root.unwrap();
+        let b = SessionId::new();
+        add_tab_beside(&mut tree, root, b);
+
+        // The bare pane became a tab group holding both, at the same root id.
+        let _ = tabs_root(&tree);
+        let mut ids = Vec::new();
+        collect_session_ids(&tree.tiles, tree.root.unwrap(), &mut ids);
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&a) && ids.contains(&b));
+    }
+
+    #[test]
+    fn add_tab_beside_within_a_split_keeps_the_split() {
+        // horizontal[A, B]; opening C beside A must give horizontal[tabs[A, C], B]
+        // — a tab added to the active side, never a new top-level tile, and the
+        // other side of the split untouched (the requirement).
+        let mut tree = empty_tree();
+        let a = SessionId::new();
+        let root = attach_pane(&mut tree, a);
+        let b = SessionId::new();
+        let b_leaf = split_tile(&mut tree, a, b, root, SplitDir::Right);
+        let a_leaf = {
+            let kids = tree.tiles.get_container(root).unwrap().children_vec();
+            *kids.iter().find(|&&k| k != b_leaf).unwrap()
+        };
+
+        let c = SessionId::new();
+        add_tab_beside(&mut tree, a_leaf, c);
+
+        // The root is still the same two-sided horizontal split.
+        let container = tree.tiles.get_container(root).unwrap();
+        assert_eq!(container.kind(), egui_tiles::ContainerKind::Horizontal);
+        let kids = container.children_vec();
+        assert_eq!(kids.len(), 2, "no new top-level tile was created");
+        assert!(
+            kids.contains(&b_leaf),
+            "the other side of the split is untouched"
+        );
+
+        // The A side is now a tab group of A and C; the B side is still just B.
+        let a_side = *kids.iter().find(|&&k| k != b_leaf).unwrap();
+        assert!(
+            matches!(
+                tree.tiles.get(a_side),
+                Some(Tile::Container(Container::Tabs(_)))
+            ),
+            "the active side became a tab group"
+        );
+        let mut a_ids = Vec::new();
+        collect_session_ids(&tree.tiles, a_side, &mut a_ids);
+        assert_eq!(a_ids.len(), 2);
+        assert!(a_ids.contains(&a) && a_ids.contains(&c));
+
+        let mut b_ids = Vec::new();
+        collect_session_ids(&tree.tiles, b_leaf, &mut b_ids);
+        assert_eq!(b_ids, vec![b]);
     }
 
     #[test]
