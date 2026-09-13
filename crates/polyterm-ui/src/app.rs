@@ -63,6 +63,8 @@ const LAYOUT_KEY: &str = "polyterm_layout";
 const RESTORE_KEY: &str = "polyterm_restore_enabled";
 /// Storage key for the SSH keys to unlock at startup.
 const STARTUP_KEYS_KEY: &str = "polyterm_startup_keys";
+/// Storage key for the "open a local shell on startup" opt-out.
+const OPEN_SHELL_KEY: &str = "polyterm_open_shell_on_startup";
 
 /// How to reopen a pane on restart (FR-95). A pane's tree key is a throwaway
 /// instance id; this is the durable part — enough to bring the session back.
@@ -113,6 +115,7 @@ enum PanelAction {
     OpenLocalShell,
     OpenSaved(SessionId),
     SetRestore(bool),
+    SetOpenShell(bool),
     /// Open the editor for a new session in this folder (FR-5).
     NewSession(FolderPath),
     /// Open the editor pre-filled from an existing session (FR-5).
@@ -211,6 +214,9 @@ pub struct TerminalApp {
     show_panel: bool,
     /// Whether to restore the tile layout on startup (FR-4 opt-in). Persisted.
     restore_enabled: bool,
+    /// Whether to open a local shell at startup when nothing else does.
+    /// Persisted; defaults on to keep the familiar behaviour.
+    open_shell_on_startup: bool,
     /// The last open error, shown in the panel until the next successful open.
     last_error: Option<String>,
 
@@ -318,6 +324,9 @@ impl TerminalApp {
         let startup_keys: Vec<PathBuf> = storage
             .and_then(|s| eframe::get_value(s, STARTUP_KEYS_KEY))
             .unwrap_or_default();
+        let open_shell_on_startup = storage
+            .and_then(|s| eframe::get_value::<bool>(s, OPEN_SHELL_KEY))
+            .unwrap_or(true);
 
         let mut app = Self {
             tree: Tree::empty(egui::Id::new("polyterm_tiles")),
@@ -341,6 +350,7 @@ impl TerminalApp {
             pending_pick: None,
             show_panel: true,
             restore_enabled,
+            open_shell_on_startup,
             last_error: None,
             theme: Theme::default(),
             font_size: 15.0,
@@ -354,8 +364,14 @@ impl TerminalApp {
             && storage
                 .and_then(|s| eframe::get_value::<PersistedLayout>(s, LAYOUT_KEY))
                 .is_some_and(|layout| app.restore(ctx, layout));
+        // Open the startup session unless a layout was restored. A default local
+        // shell is gated by the setting; an explicit `POLYTERM_SERIAL` session is
+        // not — that env var is a request in its own right.
         if !restored {
-            app.open_in_new_tab(ctx, PaneSource::Adhoc(Box::new(initial)));
+            let is_local_shell = matches!(initial.kind, SessionKind::LocalShell(_));
+            if !is_local_shell || open_shell_on_startup {
+                app.open_in_new_tab(ctx, PaneSource::Adhoc(Box::new(initial)));
+            }
         }
 
         // Pre-unlock the configured SSH keys at launch (requirement): prompt
@@ -552,6 +568,7 @@ impl TerminalApp {
             }
             PanelAction::OpenSaved(id) => self.open_in_new_tab(ctx, PaneSource::Saved(id)),
             PanelAction::SetRestore(enabled) => self.restore_enabled = enabled,
+            PanelAction::SetOpenShell(enabled) => self.open_shell_on_startup = enabled,
             PanelAction::NewSession(folder) => self.editor = Some(SessionEditor::new_in(&folder)),
             PanelAction::EditSession(id) => {
                 if let Some(spec) = self.sessions.iter().find(|s| s.id == id) {
@@ -1062,6 +1079,13 @@ impl TerminalApp {
         {
             actions.push(PanelAction::SetRestore(restore));
         }
+        let mut open_shell = self.open_shell_on_startup;
+        if ui
+            .checkbox(&mut open_shell, "Open a local shell on startup")
+            .changed()
+        {
+            actions.push(PanelAction::SetOpenShell(open_shell));
+        }
 
         ui.collapsing("SSH keys to unlock at startup", |ui| {
             for key in &self.startup_keys {
@@ -1328,6 +1352,7 @@ impl eframe::App for TerminalApp {
     /// be restored as enabled.
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, RESTORE_KEY, &self.restore_enabled);
+        eframe::set_value(storage, OPEN_SHELL_KEY, &self.open_shell_on_startup);
         eframe::set_value(storage, STARTUP_KEYS_KEY, &self.startup_keys);
         let layout = PersistedLayout {
             tree: self.tree.clone(),
