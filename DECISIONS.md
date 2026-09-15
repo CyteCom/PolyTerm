@@ -480,6 +480,15 @@ to the UI — only `polyterm-ssh` carries that, via `russh` (ADR-16).
 decrypt one. Pinned to `=0.7.0-rc.11`, the exact version `russh` resolves, so
 the tree holds a single copy.
 
+**Refinement.** `ssh-key` reads only the OpenSSH format; `russh` reads more
+(classic PEM PKCS#1, PKCS#8, SEC1). The verifier must therefore be tri-state —
+*correct*, *incorrect*, or *unverifiable* — and must **never reject** a format
+it cannot read: doing so refused a *correct* passphrase for a PEM key outright,
+blocking the connection. On *unverifiable* the passphrase is passed to the
+backend (the authority) and still cached, so it is entered once; the one thing
+lost is up-front rejection of a typo for those formats, which Settings > "Forget
+key passphrases" recovers without a restart.
+
 ---
 
 ## ADR-18 · Accepted · `rfd` for the file-open dialog

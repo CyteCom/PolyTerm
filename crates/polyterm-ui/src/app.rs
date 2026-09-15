@@ -802,6 +802,7 @@ impl TerminalApp {
         let mut browse = false;
         let mut add_key: Option<PathBuf> = None;
         let mut remove_key: Option<PathBuf> = None;
+        let mut forget_passphrases = false;
         egui::Window::new("Settings")
             .collapsible(false)
             .resizable(false)
@@ -835,6 +836,21 @@ impl TerminalApp {
                         add_key = Some(PathBuf::from(self.new_key_path.trim()));
                     }
                 });
+
+                // Recovery: clear passphrases unlocked this run. A passphrase for
+                // a format we cannot verify (a PEM key) is cached unchecked, so a
+                // typo would otherwise stick until restart; this forgets it.
+                let cached = self.passphrase_cache.len();
+                ui.add_enabled_ui(cached > 0, |ui| {
+                    if ui
+                        .button(format!("Forget key passphrases ({cached})"))
+                        .on_hover_text("Clear passphrases unlocked this run")
+                        .clicked()
+                    {
+                        forget_passphrases = true;
+                    }
+                });
+
                 ui.separator();
                 ui.weak("Ctrl+Shift+E toggles the session panel.");
             });
@@ -851,6 +867,9 @@ impl TerminalApp {
         if let Some(path) = add_key {
             self.new_key_path.clear();
             self.add_startup_key(path);
+        }
+        if forget_passphrases {
+            self.passphrase_cache.clear();
         }
     }
 
@@ -953,17 +972,26 @@ impl TerminalApp {
                     _ => None,
                 };
                 if let Some(key_path) = &passphrase_key {
-                    if !keys::passphrase_ok(key_path, &value) {
-                        self.enqueue_modal(PromptModal::credential_retry(
-                            prompt,
-                            "Wrong passphrase.".to_owned(),
-                        ));
-                        return;
+                    match keys::verify_passphrase(key_path, &value) {
+                        // Checked and wrong: re-prompt rather than cache a value
+                        // that would then fail on every later use of the key.
+                        keys::PassphraseCheck::Incorrect => {
+                            self.enqueue_modal(PromptModal::credential_retry(
+                                prompt,
+                                "Wrong passphrase.".to_owned(),
+                            ));
+                            return;
+                        }
+                        // Correct, or a format we cannot check here (a PEM key the
+                        // backend reads and we must not reject): keep it unlocked
+                        // for the run so the key is entered once. Settings >
+                        // "Forget key passphrases" clears a bad one without a
+                        // restart.
+                        keys::PassphraseCheck::Correct | keys::PassphraseCheck::Unverifiable => {
+                            self.passphrase_cache
+                                .insert(key_path.clone(), Secret::new(value.clone()));
+                        }
                     }
-                    // Verified: keep it unlocked in memory for the rest of the
-                    // run, independent of the keyring "remember" option (#1).
-                    self.passphrase_cache
-                        .insert(key_path.clone(), Secret::new(value.clone()));
                 }
                 let secret = Secret::new(value);
                 if remember && let Some(cred) = &prompt.credential {
@@ -978,15 +1006,20 @@ impl TerminalApp {
                 let secrets = values.into_iter().map(Secret::new).collect();
                 let _ = prompt.reply.send(CredentialReply::Responses(secrets));
             }
-            // Startup unlock: verify and cache, or re-prompt on a wrong pass.
+            // Startup unlock: cache the passphrase, re-prompting only if it was
+            // checked and found wrong. A format we cannot check (a PEM key) is
+            // cached anyway so it is entered once — the backend is the authority.
             (PromptModal::UnlockKey { path, .. }, ModalAnswer::CredentialSecret { value, .. }) => {
-                if keys::passphrase_ok(&path, &value) {
-                    self.passphrase_cache.insert(path, Secret::new(value));
-                } else {
-                    self.enqueue_modal(PromptModal::unlock_key_retry(
-                        path,
-                        "Wrong passphrase.".to_owned(),
-                    ));
+                match keys::verify_passphrase(&path, &value) {
+                    keys::PassphraseCheck::Incorrect => {
+                        self.enqueue_modal(PromptModal::unlock_key_retry(
+                            path,
+                            "Wrong passphrase.".to_owned(),
+                        ));
+                    }
+                    keys::PassphraseCheck::Correct | keys::PassphraseCheck::Unverifiable => {
+                        self.passphrase_cache.insert(path, Secret::new(value));
+                    }
                 }
             }
             // Skipping a startup key just leaves it locked.
