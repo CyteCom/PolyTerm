@@ -11,8 +11,6 @@
 //! (`ARCHITECTURE.md` §6.1 frames the answerer as "the binary"; since ADR-15
 //! the UI holds the store and drains the events, so the answerer lives here.)
 
-use std::path::PathBuf;
-
 use egui::{Color32, TextEdit};
 use polyterm_core::{
     CredentialPrompt, CredentialRequest, HostKeyPrompt, KnownHostStatus, TrustDecision,
@@ -39,13 +37,6 @@ pub(crate) enum PromptModal {
         inputs: Vec<String>,
         remember: bool,
         /// An error to show, e.g. after a wrong passphrase was rejected.
-        error: Option<String>,
-    },
-    /// Pre-unlocking a key at startup (FR): no backend awaits it — the entered
-    /// passphrase is verified and cached, nothing more.
-    UnlockKey {
-        path: PathBuf,
-        input: String,
         error: Option<String>,
     },
 }
@@ -102,24 +93,6 @@ impl PromptModal {
         }
     }
 
-    /// A startup unlock modal for `path`.
-    pub(crate) fn unlock_key(path: PathBuf) -> Self {
-        Self::UnlockKey {
-            path,
-            input: String::new(),
-            error: None,
-        }
-    }
-
-    /// A startup unlock modal for `path` showing `error` (a rejected passphrase).
-    pub(crate) fn unlock_key_retry(path: PathBuf, error: String) -> Self {
-        Self::UnlockKey {
-            path,
-            input: String::new(),
-            error: Some(error),
-        }
-    }
-
     pub(crate) fn show(&mut self, ctx: &egui::Context) -> ModalAnswer {
         match self {
             PromptModal::HostKey { prompt, status } => show_host_key(prompt, *status, ctx),
@@ -129,33 +102,8 @@ impl PromptModal {
                 remember,
                 error,
             } => show_credential(prompt, inputs, remember, error.as_deref(), ctx),
-            PromptModal::UnlockKey { path, input, error } => {
-                show_unlock_key(path, input, error.as_deref(), ctx)
-            }
         }
     }
-}
-
-fn show_unlock_key(
-    path: &std::path::Path,
-    input: &mut String,
-    error: Option<&str>,
-    ctx: &egui::Context,
-) -> ModalAnswer {
-    let mut answer = ModalAnswer::Pending;
-    let mut open = true;
-    window("Unlock SSH key").open(&mut open).show(ctx, |ui| {
-        if let Some(error) = error {
-            ui.colored_label(WARN, error);
-        }
-        ui.label(format!("Passphrase for {}", path.display()));
-        secret_field(ui, input);
-        answer = secret_buttons_labelled(ui, input, false, "Unlock", "Skip");
-    });
-    if !open {
-        return ModalAnswer::CredentialCancelled;
-    }
-    answer
 }
 
 fn window(title: &str) -> egui::Window<'_> {

@@ -455,7 +455,9 @@ encrypted OpenSSH private key and so verify a passphrase *before* it is cached
 or used for a startup unlock.
 
 **Why.** A key passphrase, once entered, is cached in memory and reused for
-every session using that key (and pre-unlocked at launch for configured keys).
+every session using that key. It is asked for on demand — the first session that
+needs a key prompts — never pre-unlocked at launch (that eager prompt was
+removed by preference; ask only when a passphrase is actually needed).
 Caching an unverified passphrase is a trap: a single typo would be replayed to
 every later session and silently fail, with no re-prompt, until the app
 restarts. Verification needs to load the key. The SSH backend can, but the UI

@@ -59,8 +59,6 @@ use crate::sessions::{EditorOutcome, FolderNode, SessionEditor, build_folder_tre
 const LAYOUT_KEY: &str = "polyterm_layout";
 /// Storage key for the restore-on-startup opt-in (FR-4).
 const RESTORE_KEY: &str = "polyterm_restore_enabled";
-/// Storage key for the SSH keys to unlock at startup.
-const STARTUP_KEYS_KEY: &str = "polyterm_startup_keys";
 /// Storage key for the "open a local shell on startup" opt-out.
 const OPEN_SHELL_KEY: &str = "polyterm_open_shell_on_startup";
 
@@ -167,8 +165,6 @@ enum FocusDir {
 enum PickTarget {
     /// The session editor's key-path field.
     EditorKeyPath,
-    /// The "add a startup key" field in the panel.
-    StartupKey,
     /// The "add a folder" dialog's file-path field (ADR-19).
     SessionFile,
 }
@@ -228,12 +224,10 @@ pub struct TerminalApp {
     modal: Option<PromptModal>,
     modal_queue: VecDeque<PromptModal>,
     /// Key passphrases entered this run, kept in memory (zeroised on drop) and
-    /// reused for any session that uses the same key, so a key is unlocked once.
-    /// Never persisted — it is not the keyring.
+    /// reused for any session that uses the same key, so a key is unlocked once
+    /// on demand — the first session that needs it prompts. Never persisted — it
+    /// is not the keyring.
     passphrase_cache: HashMap<PathBuf, Secret<String>>,
-    /// SSH keys to unlock at startup (persisted), and the draft path being added.
-    startup_keys: Vec<PathBuf>,
-    new_key_path: String,
     /// A file-open dialog running on its own thread, and where its result goes
     /// (ADR-18). Polled each frame; `None` when no dialog is open.
     pending_pick: Option<(PickTarget, std::sync::mpsc::Receiver<Option<PathBuf>>)>,
@@ -349,9 +343,6 @@ impl TerminalApp {
         let restore_enabled = storage
             .and_then(|s| eframe::get_value::<bool>(s, RESTORE_KEY))
             .unwrap_or(false);
-        let startup_keys: Vec<PathBuf> = storage
-            .and_then(|s| eframe::get_value(s, STARTUP_KEYS_KEY))
-            .unwrap_or_default();
         let open_shell_on_startup = storage
             .and_then(|s| eframe::get_value::<bool>(s, OPEN_SHELL_KEY))
             .unwrap_or(true);
@@ -376,8 +367,6 @@ impl TerminalApp {
             modal: None,
             modal_queue: VecDeque::new(),
             passphrase_cache: HashMap::new(),
-            startup_keys,
-            new_key_path: String::new(),
             pending_pick: None,
             show_panel: true,
             restore_enabled,
@@ -405,13 +394,9 @@ impl TerminalApp {
             }
         }
 
-        // Pre-unlock the configured SSH keys at launch (requirement): prompt
-        // once for each encrypted one, verified and cached for the run.
-        for key in app.startup_keys.clone() {
-            if keys::is_encrypted(&key) {
-                app.enqueue_modal(PromptModal::unlock_key(key));
-            }
-        }
+        // No keys are pre-unlocked at launch: a passphrase is asked for only when
+        // a session actually needs it (the first session using a key prompts, and
+        // it is then cached for the run).
         app
     }
 
@@ -656,17 +641,6 @@ impl TerminalApp {
         }
     }
 
-    /// Add an SSH key to the startup-unlock set and, if it is encrypted, prompt
-    /// to unlock it now so the change takes effect immediately (FR-21).
-    fn add_startup_key(&mut self, path: PathBuf) {
-        if !self.startup_keys.contains(&path) {
-            self.startup_keys.push(path.clone());
-        }
-        if keys::is_encrypted(&path) {
-            self.enqueue_modal(PromptModal::unlock_key(path));
-        }
-    }
-
     /// The "add a folder" dialog (ADR-19): name the folder and choose the JSON
     /// file to back it. A new file is created if the path does not exist.
     fn show_add_folder_dialog(&mut self, ctx: &egui::Context) {
@@ -799,9 +773,6 @@ impl TerminalApp {
             return;
         }
         let mut open = true;
-        let mut browse = false;
-        let mut add_key: Option<PathBuf> = None;
-        let mut remove_key: Option<PathBuf> = None;
         let mut forget_passphrases = false;
         egui::Window::new("Settings")
             .collapsible(false)
@@ -813,33 +784,11 @@ impl TerminalApp {
                     &mut self.open_shell_on_startup,
                     "Open a local shell on startup",
                 );
-                ui.separator();
-                ui.strong("SSH keys to unlock at startup");
-                for key in &self.startup_keys {
-                    ui.horizontal(|ui| {
-                        if ui.small_button("x").clicked() {
-                            remove_key = Some(key.clone());
-                        }
-                        ui.label(key.display().to_string());
-                    });
-                }
-                ui.horizontal(|ui| {
-                    ui.text_edit_singleline(&mut self.new_key_path);
-                    if ui
-                        .button("\u{1f4c1}")
-                        .on_hover_text("Choose a key file")
-                        .clicked()
-                    {
-                        browse = true;
-                    }
-                    if ui.button("Add key").clicked() && !self.new_key_path.trim().is_empty() {
-                        add_key = Some(PathBuf::from(self.new_key_path.trim()));
-                    }
-                });
 
-                // Recovery: clear passphrases unlocked this run. A passphrase for
-                // a format we cannot verify (a PEM key) is cached unchecked, so a
-                // typo would otherwise stick until restart; this forgets it.
+                // A key passphrase is asked for on demand — the first session
+                // that needs it prompts — and cached for the run. This clears the
+                // cache, e.g. to correct a passphrase mistyped for a PEM key
+                // (which cannot be verified up front) without a restart.
                 let cached = self.passphrase_cache.len();
                 ui.add_enabled_ui(cached > 0, |ui| {
                     if ui
@@ -857,16 +806,6 @@ impl TerminalApp {
 
         if !open {
             self.settings_open = false;
-        }
-        if browse {
-            self.begin_pick(ctx, PickTarget::StartupKey);
-        }
-        if let Some(path) = remove_key {
-            self.startup_keys.retain(|p| p != &path);
-        }
-        if let Some(path) = add_key {
-            self.new_key_path.clear();
-            self.add_startup_key(path);
         }
         if forget_passphrases {
             self.passphrase_cache.clear();
@@ -1006,24 +945,6 @@ impl TerminalApp {
                 let secrets = values.into_iter().map(Secret::new).collect();
                 let _ = prompt.reply.send(CredentialReply::Responses(secrets));
             }
-            // Startup unlock: cache the passphrase, re-prompting only if it was
-            // checked and found wrong. A format we cannot check (a PEM key) is
-            // cached anyway so it is entered once — the backend is the authority.
-            (PromptModal::UnlockKey { path, .. }, ModalAnswer::CredentialSecret { value, .. }) => {
-                match keys::verify_passphrase(&path, &value) {
-                    keys::PassphraseCheck::Incorrect => {
-                        self.enqueue_modal(PromptModal::unlock_key_retry(
-                            path,
-                            "Wrong passphrase.".to_owned(),
-                        ));
-                    }
-                    keys::PassphraseCheck::Correct | keys::PassphraseCheck::Unverifiable => {
-                        self.passphrase_cache.insert(path, Secret::new(value));
-                    }
-                }
-            }
-            // Skipping a startup key just leaves it locked.
-            (PromptModal::UnlockKey { .. }, ModalAnswer::CredentialCancelled) => {}
             // A Pending answer never reaches here, and the variants always match.
             _ => {}
         }
@@ -1066,7 +987,6 @@ impl TerminalApp {
                                     editor.set_key_path(text);
                                 }
                             }
-                            PickTarget::StartupKey => self.new_key_path = text,
                             PickTarget::SessionFile => {
                                 if let Some(dialog) = &mut self.add_folder {
                                     // Default the folder name to the file's stem
@@ -1643,7 +1563,6 @@ impl eframe::App for TerminalApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         eframe::set_value(storage, RESTORE_KEY, &self.restore_enabled);
         eframe::set_value(storage, OPEN_SHELL_KEY, &self.open_shell_on_startup);
-        eframe::set_value(storage, STARTUP_KEYS_KEY, &self.startup_keys);
         let layout = PersistedLayout {
             tree: self.tree.clone(),
             sources: self.sources.iter().map(|(k, v)| (*k, v.clone())).collect(),

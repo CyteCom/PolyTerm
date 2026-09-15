@@ -49,26 +49,6 @@ pub(crate) fn verify_passphrase(path: &Path, passphrase: &str) -> PassphraseChec
     }
 }
 
-/// Whether the private key at `path` is passphrase-encrypted — i.e. it has
-/// something to unlock (FR-21). Reads the OpenSSH format with `ssh-key`, and
-/// falls back to sniffing the PEM header for the markers OpenSSH/OpenSSL write
-/// on an encrypted key, so startup unlocking still fires for a classic encrypted
-/// RSA key. `false` if it cannot be read or is plainly not encrypted.
-pub(crate) fn is_encrypted(path: &Path) -> bool {
-    if let Ok(key) = PrivateKey::read_openssh_file(path) {
-        return key.is_encrypted();
-    }
-    match std::fs::read_to_string(path) {
-        Ok(text) => {
-            // PKCS#8 encrypted, or the legacy PKCS#1/SEC1 encryption headers.
-            text.contains("BEGIN ENCRYPTED PRIVATE KEY")
-                || text.contains("Proc-Type: 4,ENCRYPTED")
-                || text.contains("DEK-Info:")
-        }
-        Err(_) => false,
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
@@ -116,9 +96,8 @@ not-real-ciphertext
 ";
 
     #[test]
-    fn encrypted_key_is_detected_and_verified() {
+    fn encrypted_key_is_verified() {
         let path = temp_key(ENCRYPTED, "enc");
-        assert!(is_encrypted(&path));
         assert_eq!(
             verify_passphrase(&path, "correct-horse"),
             PassphraseCheck::Correct
@@ -131,9 +110,8 @@ not-real-ciphertext
     }
 
     #[test]
-    fn plain_key_is_not_encrypted_and_needs_no_passphrase() {
+    fn plain_key_needs_no_passphrase() {
         let path = temp_key(PLAIN, "plain");
-        assert!(!is_encrypted(&path));
         assert_eq!(
             verify_passphrase(&path, "anything"),
             PassphraseCheck::Correct
@@ -142,12 +120,10 @@ not-real-ciphertext
     }
 
     #[test]
-    fn a_pem_key_is_detected_encrypted_but_unverifiable() {
+    fn a_pem_key_is_unverifiable_not_rejected() {
         // A format `ssh-key` cannot read must never have a passphrase rejected;
-        // the backend judges it. Encryption is still detected from the header so
-        // startup unlocking fires.
+        // the backend judges it.
         let path = temp_key(PEM_ENCRYPTED, "pem");
-        assert!(is_encrypted(&path), "PEM encryption header is detected");
         assert_eq!(
             verify_passphrase(&path, "anything"),
             PassphraseCheck::Unverifiable,
@@ -157,10 +133,8 @@ not-real-ciphertext
     }
 
     #[test]
-    fn a_missing_key_cannot_be_verified() {
+    fn a_missing_key_is_unverifiable_not_rejected() {
         let path = std::env::temp_dir().join("polyterm-test-does-not-exist.key");
-        assert!(!is_encrypted(&path));
-        // Missing/unreadable is Unverifiable, not Incorrect: never a rejection.
         assert_eq!(verify_passphrase(&path, "x"), PassphraseCheck::Unverifiable);
     }
 }
