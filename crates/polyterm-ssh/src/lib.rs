@@ -38,6 +38,8 @@ use russh::{Channel, ChannelMsg, Disconnect};
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
+mod forward;
+
 /// The initial PTY size. The UI sends a real size via [`ControlMsg::Resize`]
 /// the moment the pane is laid out, so this only governs the first instant.
 const INITIAL_COLS: u32 = 80;
@@ -134,26 +136,39 @@ async fn run(cfg: SshConfig, backend: TransportBackendEnd) {
 /// returning why. The `chain` is held for the duration so its jump tunnels stay
 /// up; `size` is updated by resizes so a later reconnect can reuse it.
 async fn run_connected(
-    chain: Vec<client::Handle<HostKeyHandler>>,
+    mut chain: Vec<client::Handle<HostKeyHandler>>,
     input: &mut mpsc::Receiver<Bytes>,
     control: &mut mpsc::Receiver<ControlMsg>,
     output: &mpsc::Sender<Bytes>,
     events: &mpsc::Sender<TransportEvent>,
     size: &mut (u32, u32),
 ) -> DisconnectReason {
-    let Some(target) = chain.last() else {
+    // Take the target (last hop) out so it can be shared with forward tasks
+    // through an `Arc`; the jump hosts stay in `chain`, kept alive until this
+    // function returns so their tunnels hold the target connection up.
+    let Some(target) = chain.pop() else {
         return DisconnectReason::Failed("no session was established".to_owned());
     };
-    let channel = match open_shell(target, *size).await {
+    let target = Arc::new(target);
+    let channel = match open_shell(&target, *size).await {
         Ok(channel) => channel,
         Err(e) => return DisconnectReason::Failed(format!("could not open shell: {e}")),
     };
     let _ = events.send(TransportEvent::Connected).await;
 
-    let reason = pump(channel, input, control, output, size).await;
+    let reason = pump(
+        channel,
+        target.clone(),
+        input,
+        control,
+        output,
+        events,
+        size,
+    )
+    .await;
     let _ = target.disconnect(Disconnect::ByApplication, "", "en").await;
     reason
-    // `chain` drops here, closing the jump sessions.
+    // `chain` (jump hosts) drops here, closing the jump sessions.
 }
 
 /// The result of waiting out a reconnect backoff.
@@ -542,25 +557,29 @@ async fn ask_credential(
 /// channel output relayed. Returns why the session ended.
 async fn pump(
     mut channel: Channel<client::Msg>,
+    session: Arc<client::Handle<HostKeyHandler>>,
     input: &mut mpsc::Receiver<Bytes>,
     control: &mut mpsc::Receiver<ControlMsg>,
     output: &mpsc::Sender<Bytes>,
+    events: &mpsc::Sender<TransportEvent>,
     size: &mut (u32, u32),
 ) -> DisconnectReason {
     // Whether the remote shell reported its exit before the channel closed.
     // That distinguishes a clean logout (do not reconnect) from a link that
     // dropped out from under us (reconnect — FR-29).
     let mut exited = false;
-    loop {
+    // Port forwards owned by this connection (FR-27); aborted when it ends.
+    let mut forwards: forward::Forwards = forward::Forwards::new();
+    let reason = 'run: loop {
         tokio::select! {
             chunk = input.recv() => match chunk {
                 Some(bytes) => {
                     if channel.data_bytes(bytes).await.is_err() {
-                        return DisconnectReason::Failed("write to channel failed".to_owned());
+                        break 'run DisconnectReason::Failed("write to channel failed".to_owned());
                     }
                 }
                 // The UI dropped its input sender: the tab is closing.
-                None => return DisconnectReason::Local,
+                None => break 'run DisconnectReason::Local,
             },
             msg = control.recv() => match msg {
                 Some(ControlMsg::Resize { cols, rows }) => {
@@ -568,15 +587,23 @@ async fn pump(
                     *size = (u32::from(cols), u32::from(rows));
                     let _ = channel.window_change(size.0, size.1, 0, 0).await;
                 }
-                Some(ControlMsg::Disconnect) => return DisconnectReason::Local,
+                // Forwards ride this connection (FR-24–27): each is its own
+                // listener task, started and stopped here.
+                Some(ControlMsg::AddForward { id, spec }) => {
+                    forward::start(session.clone(), id, spec, events.clone(), &mut forwards);
+                }
+                Some(ControlMsg::RemoveForward(id)) => {
+                    forward::stop(id, &mut forwards, events).await;
+                }
+                Some(ControlMsg::Disconnect) => break 'run DisconnectReason::Local,
                 // Break/SetSignal/Reconnect do not apply to an SSH shell here yet.
                 Some(_) => {}
-                None => return DisconnectReason::Local,
+                None => break 'run DisconnectReason::Local,
             },
             msg = channel.wait() => match msg {
                 Some(ChannelMsg::Data { data }) => {
                     if output.send(Bytes::copy_from_slice(&data)).await.is_err() {
-                        return DisconnectReason::Local;
+                        break 'run DisconnectReason::Local;
                     }
                 }
                 // Merge stderr into the same stream, as a terminal shows both.
@@ -594,11 +621,11 @@ async fn pump(
                 // A server CHANNEL_CLOSE is a clean end — a logout. russh sends
                 // this only on a real close, so it is never a dropped link: do
                 // not reconnect (that is what was logging the user back in).
-                Some(ChannelMsg::Close) => return DisconnectReason::Remote,
+                Some(ChannelMsg::Close) => break 'run DisconnectReason::Remote,
                 // The channel vanished with no CLOSE: the link dropped. If the
                 // shell had already reported its exit, still treat it as clean.
                 None => {
-                    return if exited {
+                    break 'run if exited {
                         DisconnectReason::Remote
                     } else {
                         DisconnectReason::Timeout
@@ -607,7 +634,11 @@ async fn pump(
                 Some(_) => {}
             },
         }
-    }
+    };
+    // The connection is ending: drop every forward with it (§9's teardown
+    // confirmation is a UI concern, enforced before this point).
+    forward::abort_all(&mut forwards);
+    reason
 }
 
 /// Answers the host-key check by emitting a [`HostKeyPrompt`] and awaiting the
