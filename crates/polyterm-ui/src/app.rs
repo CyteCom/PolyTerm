@@ -42,8 +42,9 @@ use std::time::Instant;
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Vec2};
 use egui_tiles::{Behavior, Container, Tabs, Tile, TileId, Tiles, Tree, UiResponse};
 use polyterm_core::{
-    BoxError, CredentialReply, CredentialRequest, ExitAction, FolderPath, KnownHostStatus,
-    PtyConfig, Secret, SessionId, SessionKind, SessionSpec, TransportHandle, TrustDecision,
+    BoxError, CredentialReply, CredentialRequest, ExitAction, FolderPath, ForwardKind, ForwardSpec,
+    ForwardState, KnownHostStatus, PtyConfig, Secret, SessionId, SessionKind, SessionSpec,
+    TransportHandle, TrustDecision,
 };
 use polyterm_store::{KnownHosts, SessionLibrary, credentials};
 use serde::{Deserialize, Serialize};
@@ -153,6 +154,78 @@ struct PendingPaste {
     recipients: Vec<SessionId>,
 }
 
+/// The port-forwarding manager for one SSH connection (FR-27): the pane whose
+/// forwards it manages, and the draft fields for adding a new one.
+#[derive(Debug)]
+struct ForwardsDialog {
+    /// The pane instance whose connection owns these forwards.
+    pane: SessionId,
+    form: ForwardForm,
+}
+
+/// Draft fields for a new forward. Held as strings and parsed on add, so a
+/// half-typed port never has to be representable.
+#[derive(Debug)]
+struct ForwardForm {
+    kind: ForwardKind,
+    bind_host: String,
+    bind_port: String,
+    target_host: String,
+    target_port: String,
+    error: Option<String>,
+}
+
+impl Default for ForwardForm {
+    fn default() -> Self {
+        Self {
+            kind: ForwardKind::Local,
+            bind_host: "127.0.0.1".to_owned(),
+            bind_port: String::new(),
+            target_host: String::new(),
+            target_port: String::new(),
+            error: None,
+        }
+    }
+}
+
+impl ForwardForm {
+    /// Build a [`ForwardSpec`] from the fields, or an error message. The target
+    /// is required for `Local`/`Remote`; a `Dynamic` (SOCKS) forward names its
+    /// target per connection, so its target fields are ignored.
+    fn to_spec(&self) -> Result<ForwardSpec, String> {
+        let bind_host = non_blank(&self.bind_host).unwrap_or_else(|| "127.0.0.1".to_owned());
+        let bind_port = parse_port(&self.bind_port, "Listen port")?;
+        let (target_host, target_port) = match self.kind {
+            ForwardKind::Dynamic => (String::new(), 0),
+            _ => (
+                non_blank(&self.target_host).ok_or("Target host is required.")?,
+                parse_port(&self.target_port, "Target port")?,
+            ),
+        };
+        Ok(ForwardSpec {
+            kind: self.kind,
+            bind_host,
+            bind_port,
+            target_host,
+            target_port,
+        })
+    }
+}
+
+/// Trim to `None` if blank.
+fn non_blank(s: &str) -> Option<String> {
+    let t = s.trim();
+    (!t.is_empty()).then(|| t.to_owned())
+}
+
+/// Parse a TCP port (1–65535).
+fn parse_port(s: &str, field: &str) -> Result<u16, String> {
+    match s.trim().parse::<u16>() {
+        Ok(p) if p > 0 => Ok(p),
+        _ => Err(format!("{field} must be a number 1–65535.")),
+    }
+}
+
 /// Which way to split a tile: `Right` puts the new pane beside the current one
 /// (a horizontal row), `Down` puts it below (a vertical column). FR-85.
 #[derive(Debug, Clone, Copy)]
@@ -228,6 +301,10 @@ pub struct TerminalApp {
     confirm_delete: Option<FolderTarget>,
     /// A newline paste awaiting its single confirmation (FR-15/FR-94).
     pending_paste: Option<PendingPaste>,
+    /// The open port-forwarding manager, if any (FR-27).
+    forwards_dialog: Option<ForwardsDialog>,
+    /// A tile awaiting confirmation to close because it has active forwards (§9).
+    confirm_close: Option<TileId>,
     /// Whether the settings dialog (startup options and SSH-key unlocking) is
     /// open. Moved off the panel so a long session list cannot bury it.
     settings_open: bool,
@@ -376,6 +453,8 @@ impl TerminalApp {
             add_folder: None,
             confirm_delete: None,
             pending_paste: None,
+            forwards_dialog: None,
+            confirm_close: None,
             settings_open: false,
             modal: None,
             modal_queue: VecDeque::new(),
@@ -591,6 +670,36 @@ impl TerminalApp {
         }
         if was_root {
             self.tree.root = None;
+        }
+    }
+
+    /// Close `tile`, but confirm first if its session has active forwards (§9):
+    /// closing tears the tunnels down, so it is never silent.
+    fn request_close_tile(&mut self, tile: TileId) {
+        let has_forwards = self
+            .tree
+            .tiles
+            .get_pane(&tile)
+            .and_then(|instance| self.live.get(instance))
+            .is_some_and(|l| l.active_forward_count() > 0);
+        if has_forwards {
+            self.confirm_close = Some(tile);
+        } else {
+            self.close_tile(tile);
+        }
+    }
+
+    /// Whether the pane at `instance` is an SSH session — the only kind that
+    /// offers port forwarding (FR-24–27).
+    fn pane_is_ssh(&self, instance: SessionId) -> bool {
+        match self.sources.get(&instance) {
+            Some(PaneSource::Adhoc(spec)) => matches!(spec.kind, SessionKind::Ssh(_)),
+            Some(PaneSource::Saved(id)) => self
+                .sessions_lib
+                .as_ref()
+                .and_then(|l| l.get_session(*id))
+                .is_some_and(|s| matches!(s.kind, SessionKind::Ssh(_))),
+            None => false,
         }
     }
 
@@ -818,6 +927,164 @@ impl TerminalApp {
             return;
         }
         self.pending_paste = Some(pending);
+    }
+
+    /// The port-forwarding manager for one SSH connection (FR-27): lists the
+    /// connection's forwards with live status and adds or removes them.
+    fn show_forwards_dialog(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.forwards_dialog.take() else {
+            return;
+        };
+        // If the pane closed, so does its forwards dialog.
+        let Some(list) = self.live.get(&dialog.pane).map(|l| l.forwards()) else {
+            return;
+        };
+
+        let mut open = true;
+        let mut add = false;
+        let mut remove: Option<polyterm_core::ForwardId> = None;
+        egui::Window::new("Port forwarding")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                if list.is_empty() {
+                    ui.weak("No forwards on this connection.");
+                }
+                for f in &list {
+                    ui.horizontal(|ui| {
+                        if ui.small_button("x").on_hover_text("Remove").clicked() {
+                            remove = Some(f.id);
+                        }
+                        ui.label(describe_forward(&f.spec));
+                        let (color, text) = forward_state_badge(&f.state);
+                        ui.colored_label(color, text);
+                    });
+                }
+
+                ui.separator();
+                let form = &mut dialog.form;
+                ui.horizontal(|ui| {
+                    ui.label("Type");
+                    ui.selectable_value(&mut form.kind, ForwardKind::Local, "Local");
+                    ui.selectable_value(&mut form.kind, ForwardKind::Dynamic, "SOCKS");
+                    // Remote (-R) returns with its backend support.
+                });
+                egui::Grid::new("forward_add_fields")
+                    .num_columns(2)
+                    .spacing([8.0, 4.0])
+                    .show(ui, |ui| {
+                        ui.label("Listen");
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.bind_host)
+                                    .desired_width(110.0),
+                            );
+                            ui.label(":");
+                            ui.add(
+                                egui::TextEdit::singleline(&mut form.bind_port).desired_width(56.0),
+                            );
+                        });
+                        ui.end_row();
+                        if form.kind != ForwardKind::Dynamic {
+                            ui.label("Target");
+                            ui.horizontal(|ui| {
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.target_host)
+                                        .desired_width(110.0),
+                                );
+                                ui.label(":");
+                                ui.add(
+                                    egui::TextEdit::singleline(&mut form.target_port)
+                                        .desired_width(56.0),
+                                );
+                            });
+                            ui.end_row();
+                        }
+                    });
+                if let Some(err) = &form.error {
+                    ui.colored_label(Color32::from_rgb(0xff, 0x66, 0x66), err);
+                }
+                if ui.button("Add forward").clicked() {
+                    add = true;
+                }
+            });
+
+        if !open {
+            return;
+        }
+        if let Some(id) = remove
+            && let Some(live) = self.live.get_mut(&dialog.pane)
+        {
+            live.remove_forward(id);
+        }
+        if add {
+            match dialog.form.to_spec() {
+                Ok(spec) => {
+                    if let Some(live) = self.live.get_mut(&dialog.pane) {
+                        live.add_forward(spec);
+                    }
+                    dialog.form.bind_port.clear();
+                    dialog.form.target_host.clear();
+                    dialog.form.target_port.clear();
+                    dialog.form.error = None;
+                }
+                Err(e) => dialog.form.error = Some(e),
+            }
+        }
+        self.forwards_dialog = Some(dialog);
+    }
+
+    /// Confirm closing a session that has active forwards (§9): closing tears
+    /// its tunnels down, so it is never silent.
+    fn show_confirm_close_dialog(&mut self, ctx: &egui::Context) {
+        let Some(tile) = self.confirm_close else {
+            return;
+        };
+        let n = self
+            .tree
+            .tiles
+            .get_pane(&tile)
+            .and_then(|i| self.live.get(i))
+            .map(|l| l.active_forward_count())
+            .unwrap_or(0);
+        // The forwards (or the pane) went away while asking: just close.
+        if n == 0 {
+            self.confirm_close = None;
+            self.close_tile(tile);
+            return;
+        }
+        let plural = if n == 1 { "" } else { "s" };
+        let mut open = true;
+        let (mut confirm, mut cancel) = (false, false);
+        egui::Window::new("Close session")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!(
+                    "This session has {n} active port forward{plural}. Closing it tears \
+                     the tunnel{plural} down."
+                ));
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Close anyway").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Keep open").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if cancel || !open {
+            self.confirm_close = None;
+            return;
+        }
+        if confirm {
+            self.confirm_close = None;
+            self.close_tile(tile);
+        }
     }
 
     /// The settings dialog: startup options and the SSH keys to unlock at launch
@@ -1407,9 +1674,23 @@ impl TerminalApp {
             .iter()
             .map(|&id| (id, self.tree.tiles.parent_of(id)))
             .collect();
+        // Which panes are SSH connections — the only ones that offer forwarding.
+        let ssh_panes: HashSet<SessionId> = leaves
+            .iter()
+            .filter_map(|&id| self.tree.tiles.get_pane(&id).copied())
+            .filter(|instance| self.pane_is_ssh(*instance))
+            .collect();
 
         let paint_start = self.perf.is_some().then(Instant::now);
-        let (focus_req, split_req, close_req, broadcast_req, open_here_req) = {
+        let (
+            focus_req,
+            split_req,
+            close_req,
+            broadcast_req,
+            open_here_req,
+            forwards_req,
+            close_confirm_req,
+        ) = {
             let mut behavior = TermBehavior {
                 live: &mut self.live,
                 theme: &self.theme,
@@ -1424,6 +1705,9 @@ impl TerminalApp {
                 close_request: None,
                 broadcast_request: None,
                 open_here_request: None,
+                forwards_request: None,
+                close_confirm_request: None,
+                ssh_panes: &ssh_panes,
             };
             self.tree.ui(&mut behavior, ui);
             (
@@ -1432,6 +1716,8 @@ impl TerminalApp {
                 behavior.close_request,
                 behavior.broadcast_request,
                 behavior.open_here_request,
+                behavior.forwards_request,
+                behavior.close_confirm_request,
             )
         };
         if let Some(start) = paint_start
@@ -1459,8 +1745,23 @@ impl TerminalApp {
             );
             self.focused = Some(tile);
         }
+        // A pane-menu "Close" (like the tab ×) confirms first if the session has
+        // active forwards (§9), otherwise closes at once.
         if let Some(tile) = close_req {
-            self.close_tile(tile);
+            self.request_close_tile(tile);
+        }
+        // The tab × was pressed on a session with active forwards: confirm.
+        if let Some(tile) = close_confirm_req {
+            self.confirm_close = Some(tile);
+        }
+        // Open the port-forwarding manager for the requested pane (FR-27).
+        if let Some(tile) = forwards_req
+            && let Some(&instance) = self.tree.tiles.get_pane(&tile)
+        {
+            self.forwards_dialog = Some(ForwardsDialog {
+                pane: instance,
+                form: ForwardForm::default(),
+            });
         }
         // Toggle broadcast on the requested group (FR-91). A deliberate act,
         // never a side effect of a layout change (FR-93).
@@ -1564,7 +1865,9 @@ impl eframe::App for TerminalApp {
             || self.settings_open
             || self.add_folder.is_some()
             || self.confirm_delete.is_some()
-            || self.pending_paste.is_some();
+            || self.pending_paste.is_some()
+            || self.forwards_dialog.is_some()
+            || self.confirm_close.is_some();
         if !dialog_open && !ctx.egui_wants_keyboard_input() {
             self.route_keyboard(&ctx);
         }
@@ -1623,6 +1926,8 @@ impl eframe::App for TerminalApp {
         self.show_add_folder_dialog(&ctx);
         self.show_confirm_delete_dialog(&ctx);
         self.show_paste_confirm_dialog(&ctx);
+        self.show_forwards_dialog(&ctx);
+        self.show_confirm_close_dialog(&ctx);
         self.show_settings_dialog(&ctx);
 
         // Deliver a completed file pick (ADR-18) to its field.
@@ -1686,6 +1991,13 @@ struct TermBehavior<'a> {
     broadcast_request: Option<TileId>,
     /// An empty pane asked to open a local shell in itself this frame (FR-85).
     open_here_request: Option<TileId>,
+    /// A pane asked to open its port-forwarding manager this frame (FR-27).
+    forwards_request: Option<TileId>,
+    /// A tab-close (the tab's × button) that must be confirmed because the pane
+    /// has active forwards (§9); the close is cancelled and this is set instead.
+    close_confirm_request: Option<TileId>,
+    /// Which panes are SSH connections (so only they offer forwarding).
+    ssh_panes: &'a HashSet<SessionId>,
 }
 
 impl Behavior<SessionId> for TermBehavior<'_> {
@@ -1736,6 +2048,11 @@ impl Behavior<SessionId> for TermBehavior<'_> {
                     self.broadcast_request = Some(group);
                     ui.close();
                 }
+            }
+            // Port forwarding is an SSH-only concern (FR-24–27).
+            if self.ssh_panes.contains(pane) && ui.button("Port forwarding\u{2026}").clicked() {
+                self.forwards_request = Some(tile_id);
+                ui.close();
             }
             ui.separator();
             if ui.button("Close").clicked() {
@@ -1795,6 +2112,17 @@ impl Behavior<SessionId> for TermBehavior<'_> {
     }
 
     fn on_tab_close(&mut self, tiles: &mut Tiles<SessionId>, tile_id: TileId) -> bool {
+        // Closing a session with active forwards is confirmed first (§9): cancel
+        // this close and ask the app to prompt, closing on confirmation instead.
+        if let Some(Tile::Pane(id)) = tiles.get(tile_id)
+            && self
+                .live
+                .get(id)
+                .is_some_and(|l| l.active_forward_count() > 0)
+        {
+            self.close_confirm_request = Some(tile_id);
+            return false;
+        }
         // Drop the live terminal: that closes the input/control senders and the
         // relay receivers, and the backend shuts down when its channels close.
         if let Some(Tile::Pane(id)) = tiles.get(tile_id) {
@@ -1830,6 +2158,31 @@ fn draw_empty_pane(ui: &mut egui::Ui, theme: &Theme, draw_focus: bool) -> egui::
         painter.vline(rect.right() - 0.75, rect.top()..=rect.bottom(), s);
     }
     response
+}
+
+/// A one-line description of a forward for the manager list (FR-27).
+fn describe_forward(spec: &ForwardSpec) -> String {
+    match spec.kind {
+        ForwardKind::Local => format!(
+            "L  {}:{} \u{2192} {}:{}",
+            spec.bind_host, spec.bind_port, spec.target_host, spec.target_port
+        ),
+        ForwardKind::Remote => format!(
+            "R  {}:{} \u{2192} {}:{}",
+            spec.bind_host, spec.bind_port, spec.target_host, spec.target_port
+        ),
+        ForwardKind::Dynamic => format!("D  {}:{}  (SOCKS)", spec.bind_host, spec.bind_port),
+    }
+}
+
+/// A coloured status badge for a forward's state (FR-27).
+fn forward_state_badge(state: &ForwardState) -> (Color32, String) {
+    match state {
+        ForwardState::Starting => (Color32::from_rgb(0xd0, 0xa0, 0x30), "starting".to_owned()),
+        ForwardState::Active => (Color32::from_rgb(0x40, 0xc0, 0x40), "active".to_owned()),
+        ForwardState::Failed(e) => (Color32::from_rgb(0xff, 0x66, 0x66), format!("failed: {e}")),
+        ForwardState::Closed => (Color32::GRAY, "closed".to_owned()),
+    }
 }
 
 /// A default local-shell session, opened ad hoc from the panel (FR-56).

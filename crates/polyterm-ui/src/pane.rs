@@ -17,11 +17,14 @@
 //! and routed to the focused pane by the app so that FR-90's isolation is one
 //! audited path rather than a decision replicated in every pane.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 
 use bytes::Bytes;
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Sense, Vec2};
-use polyterm_core::{ControlMsg, ExitAction, ModemLines, TransportEvent, TransportHandle};
+use polyterm_core::{
+    ControlMsg, ExitAction, ForwardId, ForwardSpec, ForwardState, ForwardStatus, ModemLines,
+    TransportEvent, TransportHandle,
+};
 use polyterm_term::{
     CursorShape, GridSize, MouseEncoding, MouseProtocol, MouseReport, Snapshot, TermEvent, Terminal,
 };
@@ -91,6 +94,9 @@ pub(crate) struct LivePane {
     /// Set when the pending queue overflowed and input was discarded, so the UI
     /// says so (§10.3). Cleared once the queue drains.
     dropping_input: bool,
+    /// Port forwards on this connection, by id, as last reported by the backend
+    /// (FR-27). SSH only; empty for other transports.
+    forwards: HashMap<ForwardId, ForwardStatus>,
     /// Out-of-band control (resize, disconnect).
     control: mpsc::Sender<ControlMsg>,
     /// Terminal output, relayed from the transport's bounded channel.
@@ -178,6 +184,7 @@ impl LivePane {
             input,
             pending_input: VecDeque::new(),
             dropping_input: false,
+            forwards: HashMap::new(),
             control,
             output: ui_output_rx,
             events: ui_events_rx,
@@ -196,6 +203,49 @@ impl LivePane {
     /// Whether the session has ended (the backend dropped its channels).
     pub(crate) fn is_finished(&self) -> bool {
         self.finished
+    }
+
+    /// Request a new port forward on this connection (FR-24–27). Returns the id
+    /// it was given, and shows it as `Starting` at once so the UI is responsive
+    /// before the backend reports back. A no-op for a non-SSH transport, which
+    /// ignores the control message.
+    pub(crate) fn add_forward(&mut self, spec: ForwardSpec) -> ForwardId {
+        let id = ForwardId::new();
+        let _ = self.control.try_send(ControlMsg::AddForward {
+            id,
+            spec: spec.clone(),
+        });
+        self.forwards.insert(
+            id,
+            ForwardStatus {
+                id,
+                spec,
+                state: ForwardState::Starting,
+            },
+        );
+        id
+    }
+
+    /// Tear down a forward (FR-27). The backend confirms with a `Closed` status,
+    /// which removes it from the list; drop it optimistically so the row goes
+    /// even if the confirmation is slow.
+    pub(crate) fn remove_forward(&mut self, id: ForwardId) {
+        let _ = self.control.try_send(ControlMsg::RemoveForward(id));
+        self.forwards.remove(&id);
+    }
+
+    /// The forwards on this connection, for the management dialog (FR-27).
+    pub(crate) fn forwards(&self) -> Vec<ForwardStatus> {
+        self.forwards.values().cloned().collect()
+    }
+
+    /// How many forwards are established or coming up — the ones a teardown
+    /// confirmation should warn about (§9).
+    pub(crate) fn active_forward_count(&self) -> usize {
+        self.forwards
+            .values()
+            .filter(|f| matches!(f.state, ForwardState::Active | ForwardState::Starting))
+            .count()
     }
 
     /// What to do when this session ends (FR-4).
@@ -233,6 +283,15 @@ impl LivePane {
                 }
                 Ok(TransportEvent::Connected) => self.disconnected = false,
                 Ok(TransportEvent::ModemStatus(lines)) => self.modem = Some(lines),
+                // A port forward changed state (FR-27). A closed one leaves the
+                // list; the rest (starting, active, failed) stay visible.
+                Ok(TransportEvent::ForwardStatus(status)) => {
+                    if status.state == ForwardState::Closed {
+                        self.forwards.remove(&status.id);
+                    } else {
+                        self.forwards.insert(status.id, status);
+                    }
+                }
                 Ok(TransportEvent::HostKey(prompt)) => prompts.push(PendingPrompt::HostKey(prompt)),
                 Ok(TransportEvent::Credential(prompt)) => {
                     prompts.push(PendingPrompt::Credential(prompt))
