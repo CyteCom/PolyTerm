@@ -213,6 +213,14 @@ impl Terminal {
         self.term.mode().contains(TermMode::ALT_SCREEN)
     }
 
+    /// Whether the application has enabled bracketed paste (DECSET 2004). When
+    /// it has, pasted text is wrapped in `ESC[200~`…`ESC[201~` so the far end
+    /// can tell a paste from typing (FR-15). A per-terminal property, so pastes
+    /// are wrapped per session, not per tile (`ARCHITECTURE.md` §10.4).
+    pub fn bracketed_paste(&self) -> bool {
+        self.term.mode().contains(TermMode::BRACKETED_PASTE)
+    }
+
     /// Scroll `lines` toward older scrollback (FR-12).
     pub fn scroll_up(&mut self, lines: usize) {
         self.term.scroll_display(Scroll::Delta(lines as i32));

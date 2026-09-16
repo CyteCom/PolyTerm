@@ -143,6 +143,16 @@ struct AddFolderDialog {
     error: Option<String>,
 }
 
+/// A paste awaiting confirmation because it contains a newline (FR-15). The
+/// recipient set is captured at paste time — resolved exactly as a keystroke's
+/// is (§10.4) — so a later focus change cannot redirect it, and the single
+/// confirmation names how many sessions will receive it (FR-94).
+#[derive(Debug)]
+struct PendingPaste {
+    text: String,
+    recipients: Vec<SessionId>,
+}
+
 /// Which way to split a tile: `Right` puts the new pane beside the current one
 /// (a horizontal row), `Down` puts it below (a vertical column). FR-85.
 #[derive(Debug, Clone, Copy)]
@@ -216,6 +226,8 @@ pub struct TerminalApp {
     add_folder: Option<AddFolderDialog>,
     /// A folder awaiting delete confirmation, from a folder's right-click menu.
     confirm_delete: Option<FolderTarget>,
+    /// A newline paste awaiting its single confirmation (FR-15/FR-94).
+    pending_paste: Option<PendingPaste>,
     /// Whether the settings dialog (startup options and SSH-key unlocking) is
     /// open. Moved off the panel so a long session list cannot bury it.
     settings_open: bool,
@@ -363,6 +375,7 @@ impl TerminalApp {
             editor: None,
             add_folder: None,
             confirm_delete: None,
+            pending_paste: None,
             settings_open: false,
             modal: None,
             modal_queue: VecDeque::new(),
@@ -766,6 +779,47 @@ impl TerminalApp {
         self.confirm_delete = Some(target);
     }
 
+    /// The single confirmation for a newline paste (FR-15), naming how many
+    /// sessions will receive it so a broadcast is confirmed once, not per
+    /// session (FR-94). On confirm the paste fans out, each recipient wrapping
+    /// it per its own bracketed-paste mode (§10.4).
+    fn show_paste_confirm_dialog(&mut self, ctx: &egui::Context) {
+        let Some(pending) = self.pending_paste.take() else {
+            return;
+        };
+        let lines = pending.text.lines().count().max(1);
+        let n = pending.recipients.len();
+        let sessions = if n == 1 { "session" } else { "sessions" };
+        let mut open = true;
+        let (mut confirm, mut cancel) = (false, false);
+        egui::Window::new("Confirm paste")
+            .collapsible(false)
+            .resizable(false)
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(format!("Paste {lines} lines into {n} {sessions}?"));
+                ui.weak("This paste contains line breaks, so each line may run as a command.");
+                ui.separator();
+                ui.horizontal(|ui| {
+                    if ui.button("Paste").clicked() {
+                        confirm = true;
+                    }
+                    if ui.button("Cancel").clicked() {
+                        cancel = true;
+                    }
+                });
+            });
+
+        if !open || cancel {
+            return;
+        }
+        if confirm {
+            self.deliver_paste(&pending.text, &pending.recipients);
+            return;
+        }
+        self.pending_paste = Some(pending);
+    }
+
     /// The settings dialog: startup options and the SSH keys to unlock at launch
     /// (FR-4, FR-21). Moved off the panel so a long session list cannot bury it.
     fn show_settings_dialog(&mut self, ctx: &egui::Context) {
@@ -1131,11 +1185,15 @@ impl TerminalApp {
 
         let mut out: Vec<u8> = Vec::new();
         let mut copy: Option<String> = None;
+        // Pastes are handled apart from typed text: they need per-session
+        // bracketed-paste wrapping (§10.4) and a newline paste needs a single
+        // confirmation before fan-out (FR-15/FR-94).
+        let mut pastes: Vec<String> = Vec::new();
 
         for event in &events {
             match event {
                 Event::Text(text) => out.extend_from_slice(text.as_bytes()),
-                Event::Paste(text) => out.extend_from_slice(text.as_bytes()),
+                Event::Paste(text) => pastes.push(text.clone()),
                 // Ctrl+C (and Ctrl+Shift+C) reach us as `Copy`: egui-winit turns
                 // the shortcut into this event and emits no key press for it. In
                 // a terminal it copies when there is a selection and is the
@@ -1217,6 +1275,32 @@ impl TerminalApp {
                     live.send_input(&out);
                     live.on_typed();
                 }
+            }
+        }
+
+        // Deliver pastes: a newline paste is held for one confirmation naming the
+        // recipient count (FR-15/FR-94); a single-line paste goes straight out,
+        // each recipient wrapping it per its own bracketed-paste mode (§10.4).
+        for paste in pastes {
+            let recipients = self.recipients();
+            if paste.contains('\n') {
+                self.pending_paste = Some(PendingPaste {
+                    text: paste,
+                    recipients,
+                });
+                break; // one confirmation at a time
+            }
+            self.deliver_paste(&paste, &recipients);
+        }
+    }
+
+    /// Send `text` as a paste to each recipient, wrapping per that session's own
+    /// bracketed-paste mode (§10.4).
+    fn deliver_paste(&mut self, text: &str, recipients: &[SessionId]) {
+        for session in recipients {
+            if let Some(live) = self.live.get_mut(session) {
+                live.send_paste(text);
+                live.on_typed();
             }
         }
     }
@@ -1479,7 +1563,8 @@ impl eframe::App for TerminalApp {
             || self.modal.is_some()
             || self.settings_open
             || self.add_folder.is_some()
-            || self.confirm_delete.is_some();
+            || self.confirm_delete.is_some()
+            || self.pending_paste.is_some();
         if !dialog_open && !ctx.egui_wants_keyboard_input() {
             self.route_keyboard(&ctx);
         }
@@ -1537,6 +1622,7 @@ impl eframe::App for TerminalApp {
         // floating above the tree until dismissed.
         self.show_add_folder_dialog(&ctx);
         self.show_confirm_delete_dialog(&ctx);
+        self.show_paste_confirm_dialog(&ctx);
         self.show_settings_dialog(&ctx);
 
         // Deliver a completed file pick (ADR-18) to its field.

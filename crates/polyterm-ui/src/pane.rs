@@ -271,6 +271,15 @@ impl LivePane {
         }
     }
 
+    /// Queue pasted `text` toward the far end, wrapped in bracketed-paste
+    /// markers when this terminal has that mode on (FR-15). Whether to wrap is a
+    /// property of this session's own terminal state, so a broadcast paste is
+    /// wrapped per recipient (`ARCHITECTURE.md` §10.4), which is why this is
+    /// separate from [`Self::send_input`].
+    pub(crate) fn send_paste(&self, text: &str) {
+        self.send_input(&wrap_paste(text, self.terminal.bracketed_paste()));
+    }
+
     /// After delivering typed input: pin to the bottom and dismiss the
     /// selection, as every terminal does.
     pub(crate) fn on_typed(&mut self) {
@@ -742,6 +751,22 @@ fn selection_text(selection: Selection, snapshot: &Snapshot) -> Option<String> {
     }
 }
 
+/// Encode a paste toward the far end: the raw bytes, wrapped in the
+/// bracketed-paste start/end markers when `bracketed` is set (FR-15). The markers
+/// are `ESC[200~` and `ESC[201~`, exactly what a terminal in bracketed-paste
+/// mode expects.
+fn wrap_paste(text: &str, bracketed: bool) -> Vec<u8> {
+    if bracketed {
+        let mut out = Vec::with_capacity(text.len() + 12);
+        out.extend_from_slice(b"\x1b[200~");
+        out.extend_from_slice(text.as_bytes());
+        out.extend_from_slice(b"\x1b[201~");
+        out
+    } else {
+        text.as_bytes().to_vec()
+    }
+}
+
 /// Draw a rectangular border inset by `inset` pixels, `width` thick, in
 /// `color`. Uses lines so it needs no version-specific stroke-kind plumbing.
 fn inset_border(ui: &egui::Ui, rect: Rect, inset: f32, width: f32, color: Color32) {
@@ -890,6 +915,14 @@ pub(crate) fn encode_key(key: Key, ctrl: bool, alt: bool) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use polyterm_term::{Attrs, Cell as TermCell, Color, Cursor, Damage, Line};
+
+    #[test]
+    fn paste_is_wrapped_only_in_bracketed_mode() {
+        assert_eq!(wrap_paste("hi", false), b"hi");
+        assert_eq!(wrap_paste("hi", true), b"\x1b[200~hi\x1b[201~");
+        // A multi-line paste is wrapped whole, not per line.
+        assert_eq!(wrap_paste("a\nb", true), b"\x1b[200~a\nb\x1b[201~");
+    }
 
     fn snapshot_from(rows: &[&str]) -> Snapshot {
         let cols = rows.iter().map(|r| r.chars().count()).max().unwrap_or(0) as u16;
