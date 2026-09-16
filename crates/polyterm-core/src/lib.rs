@@ -21,6 +21,7 @@ pub mod prompt;
 mod rdp;
 mod secret;
 mod session;
+mod sftp;
 mod transport;
 
 pub use error::{BoxError, RdpError, TransportError};
@@ -38,6 +39,10 @@ pub use secret::{Secret, is_secret_field};
 pub use session::{
     CredentialRef, ExitAction, FlowControl, FolderPath, Parity, PtyConfig, RdpConfig, SerialConfig,
     SessionId, SessionKind, SessionSpec, SshAuth, SshConfig, SshJump, StopBits,
+};
+pub use sftp::{
+    DirEntry, FileKind, SFTP_EVENT_CAPACITY, SFTP_REQUEST_CAPACITY, SftpBackendEnd, SftpError,
+    SftpEvent, SftpHandle, SftpRequest, SftpResult, TransferProgress,
 };
 pub use transport::{
     CONTROL_CHANNEL_CAPACITY, ControlMsg, DisconnectReason, EVENT_CHANNEL_CAPACITY,

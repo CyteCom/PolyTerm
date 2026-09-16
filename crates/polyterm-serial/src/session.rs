@@ -124,12 +124,13 @@ fn run(mut port: Box<dyn SerialPort>, cfg: SerialConfig, backend: TransportBacke
                 }
                 // Resize is a no-op on serial and that is correct (ADR-5).
                 // Reconnect while already connected is likewise nothing to do,
-                // and a serial port has no forwards.
+                // and a serial port has neither forwards nor SFTP.
                 Ok(
                     ControlMsg::Resize { .. }
                     | ControlMsg::Reconnect
                     | ControlMsg::AddForward { .. }
-                    | ControlMsg::RemoveForward(_),
+                    | ControlMsg::RemoveForward(_)
+                    | ControlMsg::OpenSftp(_),
                 ) => {}
                 Ok(ControlMsg::Disconnect) => {
                     let _ = events.blocking_send(TransportEvent::Disconnected {

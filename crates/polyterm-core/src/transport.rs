@@ -12,6 +12,7 @@ use tokio::sync::mpsc;
 use crate::error::TransportError;
 use crate::forward::{ForwardId, ForwardSpec, ForwardStatus};
 use crate::prompt::{CredentialPrompt, HostKeyPrompt};
+use crate::sftp::SftpBackendEnd;
 
 /// Bytes from the far end. Bounded so that a fast remote `cat` applies
 /// backpressure to the reader task instead of growing memory without limit
@@ -157,9 +158,10 @@ pub struct ModemLines {
 /// Out-of-band control. A backend ignores what does not apply to it; that is
 /// the design, not a gap. `Resize` being a no-op on serial is correct and must
 /// not be "fixed" (ADR-5).
-// No longer `Copy`: `AddForward` carries a `ForwardSpec` with owned strings.
-// `ControlMsg` is sent by value over a channel, so `Clone` is all it needs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+// Not `Copy`/`Clone`/`Eq`: `AddForward` carries owned strings, and `OpenSftp`
+// carries channel ends that are none of those. `ControlMsg` is only ever sent
+// by value over a channel, so `Debug` is all it needs.
+#[derive(Debug)]
 pub enum ControlMsg {
     /// SSH and PTY. No-op for serial.
     Resize { cols: u16, rows: u16 },
@@ -180,6 +182,10 @@ pub enum ControlMsg {
     AddForward { id: ForwardId, spec: ForwardSpec },
     /// Tear down a forward previously added with [`Self::AddForward`] (FR-27).
     RemoveForward(ForwardId),
+    /// Open an SFTP subsystem on this session and serve it from the given
+    /// backend end (FR-35). SSH only; a no-op elsewhere. Boxed to keep the enum
+    /// small. The UI keeps the matching [`SftpHandle`](crate::SftpHandle).
+    OpenSftp(Box<SftpBackendEnd>),
 }
 
 /// Lifecycle of a session.
@@ -274,7 +280,10 @@ mod tests {
         );
 
         ui.control.try_send(ControlMsg::Break).unwrap();
-        assert_eq!(backend.control.try_recv().unwrap(), ControlMsg::Break);
+        assert!(matches!(
+            backend.control.try_recv().unwrap(),
+            ControlMsg::Break
+        ));
 
         backend.events.try_send(TransportEvent::Connected).unwrap();
         assert!(matches!(
