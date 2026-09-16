@@ -2299,6 +2299,36 @@ mod tests {
     }
 
     #[test]
+    fn broadcast_recipients_never_include_a_sibling_subtree() {
+        // The delivery path itself (resolve_recipients), not just the traversal:
+        // Tabs[ vertical[A, C], B ], multi-exec on the vertical split, focus A.
+        // A broadcast reaches A and C and never the sibling tab B (FR-90/NFR-15);
+        // with multi-exec off, only the focused pane receives input.
+        let mut tree = empty_tree();
+        let (a, b, c) = (SessionId::new(), SessionId::new(), SessionId::new());
+        let la = attach_pane(&mut tree, a);
+        let _lb = attach_pane(&mut tree, b);
+        let c_leaf = split_tile(&mut tree, a, c, la, SplitDir::Down);
+        let a_leaf = {
+            let kids = tree.tiles.get_container(la).unwrap().children_vec();
+            *kids.iter().find(|&&k| k != c_leaf).unwrap()
+        };
+
+        let multi: HashSet<TileId> = std::iter::once(la).collect();
+        let recipients = resolve_recipients(&tree.tiles, &multi, a_leaf);
+        assert_eq!(recipients.len(), 2, "broadcast reaches exactly the split");
+        assert!(recipients.contains(&a) && recipients.contains(&c));
+        assert!(
+            !recipients.contains(&b),
+            "broadcast must never reach a sibling subtree (NFR-15)"
+        );
+
+        // No multi-exec: the focused pane alone.
+        let none = HashSet::new();
+        assert_eq!(resolve_recipients(&tree.tiles, &none, a_leaf), vec![a]);
+    }
+
+    #[test]
     fn a_persisted_layout_round_trips_through_serde() {
         // FR-95: the tree structure, the reopen source of each pane, and the
         // focused tile all survive a save/restore cycle.

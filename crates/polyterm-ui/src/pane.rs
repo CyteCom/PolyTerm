@@ -17,6 +17,8 @@
 //! and routed to the focused pane by the app so that FR-90's isolation is one
 //! audited path rather than a decision replicated in every pane.
 
+use std::collections::VecDeque;
+
 use bytes::Bytes;
 use egui::{Align2, Color32, Event, FontId, Key, Pos2, Rect, Sense, Vec2};
 use polyterm_core::{ControlMsg, ExitAction, ModemLines, TransportEvent, TransportHandle};
@@ -65,6 +67,11 @@ const SCROLLBACK: usize = 10_000;
 /// backpressure all the way to the PTY (NFR-5), rather than growing without limit.
 const UI_OUTPUT_CAPACITY: usize = 256;
 
+/// Bound on the per-session pending-input queue (§10.3, NFR-16). Small on
+/// purpose: on a wedged session, discarding beats delivering a stale burst of
+/// keystrokes to a host minutes after they were typed.
+const INPUT_PENDING_CAP: usize = 64;
+
 /// One session's live terminal and the state that renders and drives it.
 #[derive(Debug)]
 pub(crate) struct LivePane {
@@ -77,6 +84,13 @@ pub(crate) struct LivePane {
 
     /// Keystrokes and pastes toward the far end.
     input: mpsc::Sender<Bytes>,
+    /// Input awaiting a full input channel (§10.3): a small bounded queue so a
+    /// briefly-wedged session keeps a few keystrokes instead of dropping them,
+    /// drained each frame in [`Self::pump`].
+    pending_input: VecDeque<Bytes>,
+    /// Set when the pending queue overflowed and input was discarded, so the UI
+    /// says so (§10.3). Cleared once the queue drains.
+    dropping_input: bool,
     /// Out-of-band control (resize, disconnect).
     control: mpsc::Sender<ControlMsg>,
     /// Terminal output, relayed from the transport's bounded channel.
@@ -162,6 +176,8 @@ impl LivePane {
             log: None,
             modem: None,
             input,
+            pending_input: VecDeque::new(),
+            dropping_input: false,
             control,
             output: ui_output_rx,
             events: ui_events_rx,
@@ -205,6 +221,9 @@ impl LivePane {
     /// (`ARCHITECTURE.md` §6). Returns the number of output bytes fed this frame,
     /// for the app's throughput instrumentation. New output pins to the bottom.
     pub(crate) fn pump(&mut self, prompts: &mut Vec<PendingPrompt>) -> usize {
+        // Flush any input queued while the channel was full (§10.3), so a
+        // recovered session catches up rather than losing what was typed.
+        self.drain_input();
         loop {
             match self.events.try_recv() {
                 Ok(TransportEvent::Disconnected { .. }) => {
@@ -262,13 +281,53 @@ impl LivePane {
     }
 
     /// Queue bytes toward the far end (a keystroke or paste routed here by the
-    /// app). Best-effort: the input channel is bounded, and dropping on a full
-    /// channel is preferable to blocking the UI thread (`ARCHITECTURE.md`
-    /// §10.3).
-    pub(crate) fn send_input(&self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            let _ = self.input.try_send(Bytes::copy_from_slice(bytes));
+    /// app). Never blocks the UI thread: the input channel is bounded, and on a
+    /// full channel the bytes go to a small pending queue drained next frame; if
+    /// that is also full they are discarded and the session is marked as
+    /// dropping input (`ARCHITECTURE.md` §10.3, NFR-16).
+    pub(crate) fn send_input(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
         }
+        let data = Bytes::copy_from_slice(bytes);
+        // Order is preserved: once anything is queued, later input queues behind
+        // it rather than jumping ahead through the channel.
+        if self.pending_input.is_empty() {
+            match self.input.try_send(data) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(data)) => self.enqueue_input(data),
+                Err(mpsc::error::TrySendError::Closed(_)) => {}
+            }
+        } else {
+            self.enqueue_input(data);
+        }
+    }
+
+    /// Push input onto the pending queue, or discard and mark if it is full.
+    fn enqueue_input(&mut self, data: Bytes) {
+        if self.pending_input.len() >= INPUT_PENDING_CAP {
+            self.dropping_input = true;
+        } else {
+            self.pending_input.push_back(data);
+        }
+    }
+
+    /// Flush queued input into the channel while it has room (§10.3).
+    fn drain_input(&mut self) {
+        while let Some(front) = self.pending_input.front().cloned() {
+            match self.input.try_send(front) {
+                Ok(()) => {
+                    self.pending_input.pop_front();
+                }
+                Err(mpsc::error::TrySendError::Full(_)) => return,
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.pending_input.clear();
+                    break;
+                }
+            }
+        }
+        // Drained (or closed): no longer dropping.
+        self.dropping_input = false;
     }
 
     /// Queue pasted `text` toward the far end, wrapped in bracketed-paste
@@ -276,8 +335,9 @@ impl LivePane {
     /// property of this session's own terminal state, so a broadcast paste is
     /// wrapped per recipient (`ARCHITECTURE.md` §10.4), which is why this is
     /// separate from [`Self::send_input`].
-    pub(crate) fn send_paste(&self, text: &str) {
-        self.send_input(&wrap_paste(text, self.terminal.bracketed_paste()));
+    pub(crate) fn send_paste(&mut self, text: &str) {
+        let wrapped = wrap_paste(text, self.terminal.bracketed_paste());
+        self.send_input(&wrapped);
     }
 
     /// After delivering typed input: pin to the bottom and dismiss the
@@ -424,6 +484,22 @@ impl LivePane {
                 .expand(8.0);
             painter.rect_filled(rect, 4.0, Color32::from_black_alpha(230));
             painter.galley(rect.min + Vec2::splat(8.0), galley, theme.foreground);
+        }
+
+        // A session that cannot drain its input fast enough is dropping it
+        // (§10.3); mark it so a wedged host is visible, not silent.
+        if self.dropping_input {
+            let warn = Color32::from_rgb(0xd0, 0x30, 0x30);
+            let font = FontId::monospace((cell_h * 0.8).max(11.0));
+            let painter = ui.painter();
+            let galley =
+                painter.layout_no_wrap("\u{26a0} input dropped".to_owned(), font, Color32::WHITE);
+            let anchor = Pos2::new(avail.right() - 6.0, avail.top() + 6.0);
+            let rect = Align2::RIGHT_TOP
+                .anchor_size(anchor, galley.size())
+                .expand(3.0);
+            painter.rect_filled(rect, 3.0, warn);
+            painter.galley(rect.min + Vec2::splat(3.0), galley, Color32::WHITE);
         }
 
         response
