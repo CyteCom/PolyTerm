@@ -123,8 +123,14 @@ fn run(mut port: Box<dyn SerialPort>, cfg: SerialConfig, backend: TransportBacke
                     let _ = port.write_request_to_send(level);
                 }
                 // Resize is a no-op on serial and that is correct (ADR-5).
-                // Reconnect while already connected is likewise nothing to do.
-                Ok(ControlMsg::Resize { .. } | ControlMsg::Reconnect) => {}
+                // Reconnect while already connected is likewise nothing to do,
+                // and a serial port has no forwards.
+                Ok(
+                    ControlMsg::Resize { .. }
+                    | ControlMsg::Reconnect
+                    | ControlMsg::AddForward { .. }
+                    | ControlMsg::RemoveForward(_),
+                ) => {}
                 Ok(ControlMsg::Disconnect) => {
                     let _ = events.blocking_send(TransportEvent::Disconnected {
                         reason: DisconnectReason::Local,

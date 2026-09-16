@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod error;
+mod forward;
 pub mod prompt;
 mod rdp;
 mod secret;
@@ -23,6 +24,7 @@ mod session;
 mod transport;
 
 pub use error::{BoxError, RdpError, TransportError};
+pub use forward::{ForwardId, ForwardKind, ForwardSpec, ForwardState, ForwardStatus};
 pub use prompt::{
     CertPrompt, CredentialPrompt, CredentialReply, CredentialRequest, HostKeyPrompt,
     InteractivePrompt, KnownHostStatus, TrustDecision,

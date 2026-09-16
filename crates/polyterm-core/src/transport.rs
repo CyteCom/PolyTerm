@@ -10,6 +10,7 @@ use tokio::runtime::Handle;
 use tokio::sync::mpsc;
 
 use crate::error::TransportError;
+use crate::forward::{ForwardId, ForwardSpec, ForwardStatus};
 use crate::prompt::{CredentialPrompt, HostKeyPrompt};
 
 /// Bytes from the far end. Bounded so that a fast remote `cat` applies
@@ -156,7 +157,9 @@ pub struct ModemLines {
 /// Out-of-band control. A backend ignores what does not apply to it; that is
 /// the design, not a gap. `Resize` being a no-op on serial is correct and must
 /// not be "fixed" (ADR-5).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+// No longer `Copy`: `AddForward` carries a `ForwardSpec` with owned strings.
+// `ControlMsg` is sent by value over a channel, so `Clone` is all it needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ControlMsg {
     /// SSH and PTY. No-op for serial.
     Resize { cols: u16, rows: u16 },
@@ -171,6 +174,12 @@ pub enum ControlMsg {
     /// Tear the session down. The backend answers with
     /// [`TransportEvent::Disconnected`] and then closes `events`.
     Disconnect,
+    /// Start a port forward (FR-24–27). SSH only; a no-op elsewhere. The `id` is
+    /// chosen by the UI so status updates correlate; progress is reported on
+    /// [`TransportEvent::ForwardStatus`].
+    AddForward { id: ForwardId, spec: ForwardSpec },
+    /// Tear down a forward previously added with [`Self::AddForward`] (FR-27).
+    RemoveForward(ForwardId),
 }
 
 /// Lifecycle of a session.
@@ -216,6 +225,9 @@ pub enum TransportEvent {
     ///
     /// [`Disconnected`]: TransportEvent::Disconnected
     Error(TransportError),
+    /// A port forward changed state (FR-27). Emitted only by the SSH backend;
+    /// other transports never forward.
+    ForwardStatus(ForwardStatus),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
