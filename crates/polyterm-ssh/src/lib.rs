@@ -22,7 +22,8 @@
 
 #![forbid(unsafe_code)]
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -31,7 +32,7 @@ use polyterm_core::{
     HostKeyPrompt, InteractivePrompt, SshAuth, SshConfig, Transport, TransportBackendEnd,
     TransportError, TransportEvent, TransportHandle, TransportKind, TrustDecision,
 };
-use russh::client::{self, Handler, KeyboardInteractiveAuthResponse};
+use russh::client::{self, ChannelOpenHandle, Handler, KeyboardInteractiveAuthResponse};
 use russh::keys::agent::client::{AgentClient, AgentStream};
 use russh::keys::{PrivateKeyWithHashAlg, load_secret_key, ssh_key};
 use russh::{Channel, ChannelMsg, Disconnect};
@@ -98,13 +99,20 @@ async fn run(cfg: SshConfig, backend: TransportBackendEnd) {
     loop {
         let _ = events.send(TransportEvent::Connecting).await;
         match establish(&cfg, config.clone(), &events).await {
-            Some(chain) => {
+            Some((chain, remote_forwards)) => {
                 connected_before = true;
                 backoff = INITIAL_BACKOFF;
                 let _ = events.send(TransportEvent::Authenticated).await;
-                let reason =
-                    run_connected(chain, &mut input, &mut control, &output, &events, &mut size)
-                        .await;
+                let reason = run_connected(
+                    chain,
+                    remote_forwards,
+                    &mut input,
+                    &mut control,
+                    &output,
+                    &events,
+                    &mut size,
+                )
+                .await;
                 // Reconnect only an unexpected drop (FR-29). A clean logout
                 // (`Remote`) or a user disconnect (`Local`) ends the session —
                 // logging back in on a logout is exactly what must not happen.
@@ -137,6 +145,7 @@ async fn run(cfg: SshConfig, backend: TransportBackendEnd) {
 /// up; `size` is updated by resizes so a later reconnect can reuse it.
 async fn run_connected(
     mut chain: Vec<client::Handle<HostKeyHandler>>,
+    remote_forwards: forward::RemoteForwards,
     input: &mut mpsc::Receiver<Bytes>,
     control: &mut mpsc::Receiver<ControlMsg>,
     output: &mpsc::Sender<Bytes>,
@@ -159,6 +168,7 @@ async fn run_connected(
     let reason = pump(
         channel,
         target.clone(),
+        remote_forwards,
         input,
         control,
         output,
@@ -215,7 +225,9 @@ async fn establish(
     cfg: &SshConfig,
     config: Arc<client::Config>,
     events: &mpsc::Sender<TransportEvent>,
-) -> Option<Vec<client::Handle<HostKeyHandler>>> {
+) -> Option<(Vec<client::Handle<HostKeyHandler>>, forward::RemoteForwards)> {
+    // One shared target map for the whole connection's remote forwards.
+    let remote_forwards: forward::RemoteForwards = Arc::new(Mutex::new(HashMap::new()));
     let mut hops: Vec<Hop> = cfg
         .jumps
         .iter()
@@ -240,6 +252,7 @@ async fn establish(
             events: events.clone(),
             host: hop.host.to_owned(),
             port: hop.port,
+            remote_forwards: remote_forwards.clone(),
         };
         let mut next = match chain.last() {
             // Tunnel through the previous hop with a direct-tcpip channel.
@@ -299,7 +312,7 @@ async fn establish(
         }
         chain.push(next);
     }
-    Some(chain)
+    Some((chain, remote_forwards))
 }
 
 /// Report a fatal setup failure as a `Disconnected` and stop.
@@ -555,9 +568,14 @@ async fn ask_credential(
 
 /// The steady-state loop: keystrokes to the channel, control messages honoured,
 /// channel output relayed. Returns why the session ended.
+// The shell channel, the session (for forwards), the forward target map, and
+// the four transport channels plus the remembered size: each is a distinct
+// concern the loop needs, so it takes them straight rather than in a bag.
+#[allow(clippy::too_many_arguments)]
 async fn pump(
     mut channel: Channel<client::Msg>,
     session: Arc<client::Handle<HostKeyHandler>>,
+    remote_forwards: forward::RemoteForwards,
     input: &mut mpsc::Receiver<Bytes>,
     control: &mut mpsc::Receiver<ControlMsg>,
     output: &mpsc::Sender<Bytes>,
@@ -590,10 +608,17 @@ async fn pump(
                 // Forwards ride this connection (FR-24–27): each is its own
                 // listener task, started and stopped here.
                 Some(ControlMsg::AddForward { id, spec }) => {
-                    forward::start(session.clone(), id, spec, events.clone(), &mut forwards);
+                    forward::start(
+                        session.clone(),
+                        id,
+                        spec,
+                        events.clone(),
+                        &mut forwards,
+                        &remote_forwards,
+                    );
                 }
                 Some(ControlMsg::RemoveForward(id)) => {
-                    forward::stop(id, &mut forwards, events).await;
+                    forward::stop(id, &mut forwards, &session, &remote_forwards, events).await;
                 }
                 Some(ControlMsg::Disconnect) => break 'run DisconnectReason::Local,
                 // Break/SetSignal/Reconnect do not apply to an SSH shell here yet.
@@ -648,6 +673,9 @@ struct HostKeyHandler {
     events: mpsc::Sender<TransportEvent>,
     host: String,
     port: u16,
+    /// Targets for this connection's remote (`-R`) forwards, shared with `pump`
+    /// so an incoming forwarded channel finds where to deliver it (FR-25).
+    remote_forwards: forward::RemoteForwards,
 }
 
 impl Handler for HostKeyHandler {
@@ -679,6 +707,31 @@ impl Handler for HostKeyHandler {
             rx.await,
             Ok(TrustDecision::AcceptOnce | TrustDecision::AcceptAndRemember)
         ))
+    }
+
+    /// The server opened a channel for a remote (`-R`) forward we requested
+    /// (FR-25). Accept it and, if a target is registered for the bind it names,
+    /// connect there locally and pipe. The lock is dropped before the await, so
+    /// the returned future stays `Send`.
+    async fn server_channel_open_forwarded_tcpip(
+        &mut self,
+        channel: Channel<client::Msg>,
+        connected_address: &str,
+        connected_port: u32,
+        _originator_address: &str,
+        _originator_port: u32,
+        reply: ChannelOpenHandle,
+        _session: &mut client::Session,
+    ) -> Result<(), Self::Error> {
+        let target = self.remote_forwards.lock().ok().and_then(|map| {
+            map.get(&(connected_address.to_owned(), connected_port as u16))
+                .cloned()
+        });
+        reply.accept().await;
+        if let Some((host, port)) = target {
+            forward::accept_remote(channel, host, port);
+        }
+        Ok(())
     }
 }
 

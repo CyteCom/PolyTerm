@@ -967,8 +967,8 @@ impl TerminalApp {
                 ui.horizontal(|ui| {
                     ui.label("Type");
                     ui.selectable_value(&mut form.kind, ForwardKind::Local, "Local");
+                    ui.selectable_value(&mut form.kind, ForwardKind::Remote, "Remote");
                     ui.selectable_value(&mut form.kind, ForwardKind::Dynamic, "SOCKS");
-                    // Remote (-R) returns with its backend support.
                 });
                 egui::Grid::new("forward_add_fields")
                     .num_columns(2)

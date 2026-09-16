@@ -10,12 +10,12 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use polyterm_core::{
     ForwardId, ForwardKind, ForwardSpec, ForwardState, ForwardStatus, TransportEvent,
 };
-use russh::client;
+use russh::{Channel, client};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
@@ -23,9 +23,23 @@ use tokio::task::JoinHandle;
 
 use crate::HostKeyHandler;
 
+/// Targets for active remote (`-R`) forwards, keyed by the server-side bind
+/// `(address, port)` we requested, so an incoming forwarded channel finds where
+/// to deliver it locally. Shared between the connection's Handler (which
+/// receives the channels) and its `pump` (which registers the targets).
+pub(crate) type RemoteForwards = Arc<Mutex<HashMap<(String, u16), (String, u16)>>>;
+
+/// How a running forward is stopped.
+pub(crate) enum Running {
+    /// Local/Dynamic: abort the local listener task.
+    Listener(JoinHandle<()>),
+    /// Remote: cancel the server-side listen for this bind.
+    Remote { bind_host: String, bind_port: u16 },
+}
+
 /// The set of running forwards, keyed by the UI-chosen id so a remove can find
-/// and abort the right one. Each entry keeps the spec for status reporting.
-pub(crate) type Forwards = HashMap<ForwardId, (ForwardSpec, JoinHandle<()>)>;
+/// the right one. Each entry keeps the spec for status reporting.
+pub(crate) type Forwards = HashMap<ForwardId, (ForwardSpec, Running)>;
 
 /// Start a forward and store its task. Local and Dynamic are handled here;
 /// Remote is not yet supported and reports `Failed` so the request is not silent.
@@ -35,43 +49,97 @@ pub(crate) fn start(
     spec: ForwardSpec,
     events: mpsc::Sender<TransportEvent>,
     forwards: &mut Forwards,
+    remote_forwards: &RemoteForwards,
 ) {
     match spec.kind {
         ForwardKind::Local | ForwardKind::Dynamic => {
             let task = tokio::spawn(listen(session, id, spec.clone(), events));
-            forwards.insert(id, (spec, task));
+            forwards.insert(id, (spec, Running::Listener(task)));
         }
         ForwardKind::Remote => {
+            // Register the target so an incoming forwarded channel finds it,
+            // then ask the server to listen. Its channels arrive at the Handler.
+            if let Ok(mut map) = remote_forwards.lock() {
+                map.insert(
+                    (spec.bind_host.clone(), spec.bind_port),
+                    (spec.target_host.clone(), spec.target_port),
+                );
+            }
+            let (session, events, spec2) = (session.clone(), events.clone(), spec.clone());
             tokio::spawn(async move {
-                report(
-                    &events,
-                    id,
-                    &spec,
-                    ForwardState::Failed("remote (-R) forwarding is not yet supported".to_owned()),
-                )
-                .await;
+                match session
+                    .tcpip_forward(spec2.bind_host.clone(), u32::from(spec2.bind_port))
+                    .await
+                {
+                    Ok(_) => report(&events, id, &spec2, ForwardState::Active).await,
+                    Err(e) => {
+                        report(
+                            &events,
+                            id,
+                            &spec2,
+                            ForwardState::Failed(format!("remote forward refused: {e}")),
+                        )
+                        .await;
+                    }
+                }
             });
+            let running = Running::Remote {
+                bind_host: spec.bind_host.clone(),
+                bind_port: spec.bind_port,
+            };
+            forwards.insert(id, (spec, running));
         }
     }
 }
 
-/// Abort a running forward and report it closed (FR-27).
+/// Abort a running forward and report it closed (FR-27). A remote forward also
+/// cancels the server-side listen and drops its target mapping.
 pub(crate) async fn stop(
     id: ForwardId,
     forwards: &mut Forwards,
+    session: &Arc<client::Handle<HostKeyHandler>>,
+    remote_forwards: &RemoteForwards,
     events: &mpsc::Sender<TransportEvent>,
 ) {
-    if let Some((spec, task)) = forwards.remove(&id) {
-        task.abort();
+    if let Some((spec, running)) = forwards.remove(&id) {
+        match running {
+            Running::Listener(task) => task.abort(),
+            Running::Remote {
+                bind_host,
+                bind_port,
+            } => {
+                if let Ok(mut map) = remote_forwards.lock() {
+                    map.remove(&(bind_host.clone(), bind_port));
+                }
+                let _ = session
+                    .cancel_tcpip_forward(bind_host, u32::from(bind_port))
+                    .await;
+            }
+        }
         report(events, id, &spec, ForwardState::Closed).await;
     }
 }
 
-/// Abort every forward without reporting (the whole session is ending).
+/// Abort every forward without reporting (the whole session is ending). Remote
+/// listens need no cancel — the server drops them when the session closes.
 pub(crate) fn abort_all(forwards: &mut Forwards) {
-    for (_, (_, task)) in forwards.drain() {
-        task.abort();
+    for (_, (_, running)) in forwards.drain() {
+        if let Running::Listener(task) = running {
+            task.abort();
+        }
     }
+}
+
+/// Deliver an incoming remote-forwarded channel to its local target: connect a
+/// TCP socket to `host:port` and copy both ways. Called by the Handler when the
+/// server opens a channel for a `-R` forward.
+pub(crate) fn accept_remote(channel: Channel<client::Msg>, host: String, port: u16) {
+    tokio::spawn(async move {
+        if let Ok(mut tcp) = TcpStream::connect((host.as_str(), port)).await {
+            let mut stream = channel.into_stream();
+            let _ = tokio::io::copy_bidirectional(&mut tcp, &mut stream).await;
+        }
+    });
 }
 
 /// Bind the listener and accept connections until aborted. Reports `Active` once
