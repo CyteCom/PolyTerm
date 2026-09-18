@@ -11,6 +11,7 @@ repository.workspace = true
 polyterm-core = { path = "../polyterm-core" }
 tokio = { workspace = true }
 russh = { workspace = true }
+russh-sftp = { workspace = true }
 bytes = { workspace = true }
 tracing = { workspace = true }
 

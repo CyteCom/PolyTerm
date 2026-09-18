@@ -40,6 +40,7 @@ use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot};
 
 mod forward;
+mod sftp;
 
 /// The initial PTY size. The UI sends a real size via [`ControlMsg::Resize`]
 /// the moment the pane is laid out, so this only governs the first instant.
@@ -619,6 +620,11 @@ async fn pump(
                 }
                 Some(ControlMsg::RemoveForward(id)) => {
                     forward::stop(id, &mut forwards, &session, &remote_forwards, events).await;
+                }
+                // Open SFTP on this same session (FR-35): the client runs on its
+                // own subsystem channel, served in its own task.
+                Some(ControlMsg::OpenSftp(backend)) => {
+                    tokio::spawn(sftp::serve(session.clone(), *backend));
                 }
                 Some(ControlMsg::Disconnect) => break 'run DisconnectReason::Local,
                 // Break/SetSignal/Reconnect do not apply to an SSH shell here yet.

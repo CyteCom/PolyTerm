@@ -565,3 +565,36 @@ misleadingly-named database for a handful of host keys); one JSON file for the w
 **Note.** FR-7 (export/import a portable format) is now nearly the native format; a future
 "export" is mostly a copy. The per-file `version` field is reserved for a forward-compatible
 schema bump.
+
+---
+
+## ADR-20 · Accepted · `russh-sftp` for the SFTP client, on the shared session
+
+**Decision.** `polyterm-ssh` depends on `russh-sftp` (3.x) for the SFTP protocol
+client. The browser pane shares the shell's authenticated connection (FR-35,
+`ARCHITECTURE.md` §8): on `ControlMsg::OpenSftp`, the SSH transport opens an
+`sftp` subsystem channel on the *same* `russh` session and runs a
+`russh-sftp` `SftpSession` over `channel.into_stream()`. No second
+authentication.
+
+**Why.** SFTP is its own protocol layered on an SSH channel; `russh` itself does
+not implement it. `russh-sftp` is the companion client crate, is pure Rust
+(adds no C dependency beyond `russh`'s existing `ring`, ADR-16), and speaks to a
+`russh` channel directly through the `AsyncRead`/`AsyncWrite` stream a channel
+exposes — which is exactly what "share the connection" needs. Its `File` type
+implements tokio's async I/O traits, so transfers are a chunked copy loop with
+progress rather than bespoke packet handling.
+
+**Shape.** The UI never names `russh-sftp` (ADR-11): it holds a protocol-neutral
+`SftpHandle` (core), sends `SftpRequest`s each carrying their own reply channel,
+and polls the replies — it cannot block the egui thread. The backend serves each
+request as its own task over a shared `Arc<SftpSession>`, so a large transfer
+does not hold up a listing.
+
+**Rejected.** A second SSH connection dedicated to SFTP (simpler, but a second
+auth and not FR-35's shared connection); implementing the SFTP packet protocol
+by hand on a raw channel (weeks of work for a solved problem).
+
+**Revisit if.** `russh-sftp` proves unmaintained against a future `russh`, at
+which point the `SftpHandle` boundary means a replacement touches only
+`polyterm-ssh`.
